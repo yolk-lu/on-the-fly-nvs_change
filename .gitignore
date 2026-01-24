@@ -7,3 +7,5 @@ Gaussian_Viewer.ini
 .vscode
 data/
 results*
+tests/
+assets/

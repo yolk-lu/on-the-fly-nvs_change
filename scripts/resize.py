@@ -6,7 +6,7 @@ import concurrent.futures
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--scene_folder', default="../data/Meta/university2")
-    parser.add_argument('--downsampling', default=1.5)
+    parser.add_argument('--downsampling', default=2)
     args = parser.parse_args()
 
     in_folder = f"{args.scene_folder}/images"

@@ -75,6 +75,9 @@ $env:DISTUTILS_USE_SDK=1 # (If you use PowerShell)
 # Get the versions corresponding to your compute platform at https://pytorch.org/
 pip install torch torchvision xformers --index-url https://download.pytorch.org/whl/cu128
 pip install cupy-cuda12x
+
+# 若是diff等pip失敗 改成進入各個submodules 去pip install . --no-build-isolation (前提：有安裝torch 且nvcc -V 有正確顯示版本)
+# 除了graphdecoviewer可直接pip install 
 pip install -r requirements.txt
 ```
 

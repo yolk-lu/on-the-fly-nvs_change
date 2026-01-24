@@ -56,7 +56,7 @@ def get_args():
         
     ## Training schedule and losses
     parser.add_argument('--lambda_dssim', type=float, default=0.2, help="Weight for DSSIM loss")
-    parser.add_argument('--num_iterations', type=int, default=30, 
+    parser.add_argument('--num_iterations', type=int, default=10, 
                         help="Number of training iterations per keyframe")
     parser.add_argument('--depth_loss_weight_init', type=float, default=1e-2)
     parser.add_argument('--depth_loss_weight_decay', type=float, default=0.9, 
@@ -74,7 +74,7 @@ def get_args():
                         help="Maximum reprojection error for matching keypoints, proportion of the image width. This is used to filter outliers and discard points at triangulation.")
     parser.add_argument('--fundmat_samples', type=int, default=2000,
                         help="Maximum number of set of matches used to estimate the fundamental matrix for outlier removal")
-    parser.add_argument('--min_num_inliers', type=int, default=100,
+    parser.add_argument('--min_num_inliers', type=int, default=50, #100
                         help="The keyframe will be added only if the number of inliers is greater than this value")
     # Initial mini bundle adjustment
     parser.add_argument('--num_keyframes_miniba_bootstrap', type=int, default=8,
@@ -93,7 +93,7 @@ def get_args():
     # Incremental pose optimization
     parser.add_argument('--num_prev_keyframes_miniba_incr', type=int, default=6,
                         help="Number of previous keyframes for incremental pose initialization")
-    parser.add_argument('--num_prev_keyframes_check', type=int, default=20,
+    parser.add_argument('--num_prev_keyframes_check', type=int, default=15, #20
                         help="Number of previous keyframes to check for matches with new keyframe")
     parser.add_argument('--pnpransac_samples', type=int, default=2000,
                         help="Maximum number of set of 2D-3D matches used to estimate the initial pose and outlier removal")
@@ -108,6 +108,17 @@ def get_args():
     # Anchor management
     parser.add_argument('--anchor_overlap', type=float, default=0.3,
                         help="Size of the overlapping regions when blending between anchors")
+
+    ## Level of Detail (LoD) options
+    parser.add_argument('--lod_min', type=int, default=1, help="Minimum level of detail")
+    parser.add_argument('--lod_max', type=int, default=1, help="Maximum level of detail")
+    parser.add_argument('--lod1_scaling_lower_bound', type=float, default=0.001, 
+                        help="Lower bound for scaling at LoD 1")
+    parser.add_argument('--lod_scaling_ratio', type=float, default=2.0, 
+                        help="Ratio for scaling reduction between LoDs")
+    parser.add_argument('--increase_lod_num_childs', type=int, default=2, 
+                        help="Number of children to spawn when increasing LoD")
+
 
     ## Keyframe management
     parser.add_argument('--max_active_keyframes', type=int, default=200,
@@ -129,7 +140,7 @@ def get_args():
 
     ## Viewer
     parser.add_argument('--viewer_mode', choices=['local', 'server', 'web', 'none'], default='none')
-    parser.add_argument('--ip', type=str, default="0.0.0.0", 
+    parser.add_argument('--ip', type=str, default="140.119.164.24", 
                         help="IP address of the viewer client, if using server viewer_mode")
     parser.add_argument('--port', type=int, default=6009,
                         help="Port of the viewer client, if using server viewer_mode")

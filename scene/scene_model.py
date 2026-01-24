@@ -24,7 +24,7 @@ import numpy as np
 
 import lpips
 from fused_ssim import fused_ssim
-from diff_gaussian_rasterization import (
+from diff_gaussian_rasterization_SG import (
     GaussianRasterizationSettings,
     GaussianRasterizer,
 )
@@ -88,6 +88,15 @@ class SceneModel:
         except:
             self.lpips = None
 
+        # LoD initialization (Moved out of inference_mode block to support rendering)
+        self.lod_min = getattr(args, 'lod_min', 1)
+        self.lod_max = getattr(args, 'lod_max', 1)
+        self.lod1_scaling_lower_bound = getattr(args, 'lod1_scaling_lower_bound', 0.001)
+        self.lod_scaling_ratio = getattr(args, 'lod_scaling_ratio', 2.0)
+        self.increase_lod_num_childs = getattr(args, 'increase_lod_num_childs', 2)
+        self.current_lod = self.lod_min
+        self.setup_scaling_activation()
+
         if not inference_mode:
             self.num_prev_keyframes_check = args.num_prev_keyframes_check
             self.active_sh_degree = args.sh_degree
@@ -106,7 +115,11 @@ class SceneModel:
                 }
             }
 
+
             ## Initialize Gaussian parameters
+            # TODO:  修改f_rest(SH的degree 1~3) 
+
+
             self.gaussian_params = {
                 "xyz": {
                     "val": torch.empty(0, 3, device="cuda"),
@@ -116,15 +129,30 @@ class SceneModel:
                     "val": torch.empty(0, 1, 3, device="cuda"),
                     "lr": args.feature_lr,
                 },
+
+                # original 
+                # "f_rest": {
+                #     "val": torch.empty(
+                #         0,
+                #         (self.max_sh_degree + 1) * (self.max_sh_degree + 1) - 1,
+                #         3,
+                #         device="cuda",
+                #     ),
+                #     "lr": args.feature_lr / 20.0,
+                # },
+
+                # Define Spherical Gaussian Coefficients : Axis(3) + Sharpness(1) + Amplitude(3)
+                # "f_rest":{
+                #   "val": torch.empty(0, 7, 3, device="cuda"),
+                #   "lr": args.feature_lr
+                # },
+                #
+                #
                 "f_rest": {
-                    "val": torch.empty(
-                        0,
-                        (self.max_sh_degree + 1) * (self.max_sh_degree + 1) - 1,
-                        3,
-                        device="cuda",
-                    ),
-                    "lr": args.feature_lr / 20.0,
+                    "val": torch.empty(0, 7, device="cuda"),
+                    "lr": args.feature_lr
                 },
+
                 "scaling": {
                     "val": torch.empty(0, 3, device="cuda"),
                     "lr": args.scaling_lr,
@@ -190,6 +218,63 @@ class SceneModel:
             self.gaussian_params, (0.5, 0.99), lr_dict=self.lr_dict
         )
 
+    def setup_scaling_activation(self):
+        if self.current_lod < self.lod_max:
+            self.scaling_lower_bound = self.lod1_scaling_lower_bound / self.lod_scaling_ratio ** (self.current_lod - 1)
+        else:
+            self.scaling_lower_bound = 0.0
+
+    def increase_lod(self):
+        if self.current_lod >= self.lod_max:
+            return
+
+        scaling_lower_bound_old = self.scaling_lower_bound
+        self.current_lod += 1
+        self.setup_scaling_activation()
+        scaling_lower_bound_new = self.scaling_lower_bound
+        
+        # Calculate Scene Center for Geometric LoD
+        scene_center = torch.zeros(3, device="cuda")
+        if self.approx_cam_centres is not None:
+             scene_center = self.approx_cam_centres.mean(dim=0).to("cuda")
+
+        # Increase LoD for all anchors
+        for anchor in self.anchors:
+            # GEOMETRIC DISTANCE SPLITTING
+            # 1. Get positions
+            xyz = anchor.gaussian_params["xyz"]["val"]
+            
+            # 2. Compute Distance to Center
+            dists = torch.norm(xyz - scene_center, dim=1)
+            
+            # 3. Define Threshold (Mean + 1 StdDev)
+            # This captures the "Core" of the scene. Outliers/Background are further away.
+            dist_threshold = dists.mean() + dists.std()
+            
+            # 4. Create Split Mask
+            # Close: Split (num_childs)
+            # Far: Keep (1)
+            num_childs_tensor = torch.ones(xyz.shape[0], dtype=torch.long, device=xyz.device)
+            split_mask = dists < dist_threshold
+            num_childs_tensor[split_mask] = self.increase_lod_num_childs
+            
+            # 5. Execute Split
+            anchor.increase_lod(num_childs_tensor, scaling_lower_bound_old, scaling_lower_bound_new)
+        
+        # Update references if active anchor was modified
+        self.gaussian_params = self.active_anchor.gaussian_params
+        
+        # Reset optimizer for new parameters
+        self.reset_optimizer()
+        
+        # Reset other buffers if needed (e.g. max_radii2D)
+        # Usually train.py handles loop variables, but max_radii2D is often in SceneModel or external?
+        # SceneModel doesn't seem to store max_radii2D persistently as a class member in __init__, 
+        # but train.py might use it. 
+        # However, since we split Gaussians, the old max_radii2D is invalid size-wise (N changed).
+        # We should ensure the training loop knows to reset/resize its buffers.
+
+
     @property
     def xyz(self):
         return self.gaussian_params["xyz"]["val"]
@@ -204,7 +289,9 @@ class SceneModel:
 
     @property
     def scaling(self):
-        return torch.exp(self.gaussian_params["scaling"]["val"])
+        # return torch.exp(self.gaussian_params["scaling"]["val"])
+        return torch.exp(self.gaussian_params["scaling"]["val"]) + self.scaling_lower_bound
+
 
     @property
     def rotation(self):
@@ -219,7 +306,8 @@ class SceneModel:
         return self.xyz.shape[0]
 
     @classmethod
-    def from_scene(cls, scene_dir: str, args):
+    # def from_scene(cls, scene_dir: str, args):
+    def from_scene(cls, scene_dir: str, args, lod=None):
         with open(os.path.join(scene_dir, "metadata.json")) as f:
             metadata = json.load(f)
 
@@ -232,13 +320,25 @@ class SceneModel:
         # Load anchors
         scene_model.anchors = []
         for i in range(len(metadata["anchors"])):
+            anchor_filename = f"anchor_{i}_lod_{lod}.ply" if lod is not None else f"anchor_{i}.ply"
+            # If explicit LoD requested but not found, fallback or duplicate check?
+            # For now assume checking the exact file availability in calling script or just let it fail/try default.
+            # But "saved with lod" means "anchor_0_lod_X.ply".
+            # The metadata might not track filename, so this heuristic is needed.
+            
             scene_model.anchors.append(
                 Anchor.from_ply(
-                    os.path.join(scene_dir, "point_clouds", f"anchor_{i}.ply"),
+                    # os.path.join(scene_dir, "point_clouds", f"anchor_{i}.ply"),
+                    os.path.join(scene_dir, "point_clouds", anchor_filename),
                     torch.tensor(metadata["anchors"][i]["position"]),
                     metadata["config"]["sh_degree"],
                 )
             )
+
+
+        if lod is not None:
+            scene_model.current_lod = lod
+            scene_model.setup_scaling_activation()
 
         scene_model.active_anchor = scene_model.anchors[0]
 
@@ -512,6 +612,7 @@ class SceneModel:
             # Load and blend anchors if in inference mode 
             if self.inference_mode and not top_view:
                 self.gaussian_params, self.anchor_weights = Anchor.blend(cam_centre, self.anchors, self.anchor_overlap)
+            
             screenspace_points = torch.zeros_like(self.xyz, requires_grad=True)
             if self.xyz.shape[0] > 0:
                 # Set constant scaling and opacity to visualize the Gaussians' positions in the top view
@@ -521,6 +622,71 @@ class SceneModel:
                 else:
                     scaling = self.scaling
                     opacity = self.opacity
+                    
+                    # --- Perceptual LoD Modulation (Opacity Soft-Thresholding) ---
+                    if hasattr(self, 'perceptual_lod_config') and self.perceptual_lod_config:
+                        # Unpack config
+                        k_ecc = self.perceptual_lod_config.get('k_ecc', 0.0)
+                        # k_vel = self.perceptual_lod_config.get('k_vel', 0.0) # Not implemented yet as we need velocity
+                        tau_min = self.perceptual_lod_config.get('tau_min', 0.5)
+                        tau_max = self.perceptual_lod_config.get('tau_max', 3.0)
+                        
+                        # 1. Compute Depth and Eccentricity
+                        # view_matrix is World-to-Camera (Check transpose convention!)
+                        # In this repo, view_matrix seems to be used directly in rasterizer.
+                        # Usually rasterizer expects Row-Major (Points @ Matrix).
+                        # Let's assume standard P_view = xyz_h @ view_matrix
+                        
+                        xyz = self.xyz
+                        ones = torch.ones((xyz.shape[0], 1), device=xyz.device)
+                        xyz_h = torch.cat([xyz, ones], dim=1)
+                        
+                        # Transform to Camera Space
+                        P_cam = xyz_h @ view_matrix # (N, 4)
+                        depth = P_cam[:, 2]
+                        depth = torch.clamp(depth, min=0.01) # Avoid div by zero
+                        
+                        # Project to Screen (NDC)
+                        # projection_matrix is (4, 4)
+                        P_clip = xyz_h @ projection_matrix # (N, 4)
+                        w_clip = P_clip[:, 3]
+                        inv_w = 1.0 / (w_clip + 1e-7)
+                        x_ndc = P_clip[:, 0] * inv_w
+                        y_ndc = P_clip[:, 1] * inv_w
+                        
+                        # Eccentricity (Distance from center in NDC)
+                        # Center is (0, 0)
+                        e = torch.sqrt(x_ndc**2 + y_ndc**2)
+                        
+                        # Weight Factors
+                        W_ecc = 1.0 / (1.0 + k_ecc * e)
+                        # W_vel = 1.0 # Assume static for now
+                        W_percept = W_ecc # * W_vel
+                        
+                        # Effective Radius (Eq 4.1 & 4.2)
+                        # r = (s * f) / d
+                        # Get max scale
+                        s = torch.max(scaling, dim=1).values
+                        
+                        # Focal length f (pixels)
+                        # tanfovx = math.tan(fov_x * 0.5) -> fov_x is in radians?
+                        # The args passed 'tanfovx' to rasterizer settings.
+                        # f = W / (2 * tanfovx)
+                        f_x = width / (2.0 * tanfovx)
+                        f_y = height / (2.0 * tanfovy)
+                        f = (f_x + f_y) * 0.5
+                        
+                        r = (s * f) / depth
+                        r_hat = r * W_percept
+                        
+                        # Soft Thresholding (Eq 4.6)
+                        # smoothstep(min, max, x)
+                        t = torch.clamp((r_hat - tau_min) / (tau_max - tau_min), 0.0, 1.0)
+                        modulation = t * t * (3.0 - 2.0 * t)
+                        
+                        opacity = opacity * modulation.unsqueeze(-1)
+                    # -----------------------------------------------------------
+
                 color, invdepth, mainGaussID, radii = rasterizer(
                     self.xyz,
                     screenspace_points,
@@ -773,12 +939,40 @@ class SceneModel:
         opacities = inverse_sigmoid(opacities)
 
         ## Initialize SH, rotations as identity
-        f_rest = torch.zeros(
-            f_dc.shape[0],
-            (self.max_sh_degree + 1) * (self.max_sh_degree + 1) - 1,
-            3,
-            device="cuda",
-        )
+
+#------------------------------------------------------------------------------------------------------------------
+        # TODO: 修改f_rest的初始值, 因為現在使用SG取代, 所以不能設定成0
+
+        # Original
+        # f_rest = torch.zeros(
+        #     f_dc.shape[0],
+        #     (self.max_sh_degree + 1) * (self.max_sh_degree + 1) - 1,
+        #     3,
+        #     device="cuda",
+        # )
+
+
+        # Change
+ 
+        # Axis
+        # 相機的中心視角
+        cam_center = keyframe.approx_centre
+        
+        # 計算點到相機的方向向量
+        dir_to_cam = cam_center[None, :] - new_pts
+        init_axis = F.normalize(dir_to_cam, dim=-1)  # 單位向量
+
+        #Sharpness
+        init_sharpness = torch.ones(new_pts.shape[0], 1, device="cuda") * 2.0  # 初始銳度值
+
+        # Amplitude
+        init_amplitude = inverse_sigmoid(torch.ones(new_pts.shape[0], 3, device='cuda') * 0.1)
+
+        # concatenate SG parameters
+        f_rest = torch.cat([init_axis, init_sharpness, init_amplitude], dim=1)
+
+#------------------------------------------------------------------------------------------------------------------
+
         rots = torch.zeros(f_dc.shape[0], 4, device="cuda")
         rots[:, 0] = 1
 
@@ -957,7 +1151,8 @@ class SceneModel:
                     merged_gaussians = {
                         "xyz": (self.gaussian_params["xyz"]['val'][selected_nn_idx, :] * weights).sum(dim=1),
                         "f_dc": (self.gaussian_params["f_dc"]['val'][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1),
-                        "f_rest": (self.gaussian_params["f_rest"]['val'][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1),
+                        "f_rest": (self.gaussian_params["f_rest"]["val"][selected_nn_idx, :] * weights).sum(dim=1),
+                        # "f_rest": (self.gaussian_params["f_rest"]['val'][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1),
                         "opacity": inverse_sigmoid(self.gaussian_params["opacity"]['val'][selected_nn_idx, :].sigmoid() * weights).sum(dim=1),
                         "scaling": torch.log((torch.exp(self.gaussian_params["scaling"]['val'][selected_nn_idx, :]) * weights * (k+1)).sum(dim=1)),
                         "rotation": (self.gaussian_params["rotation"]['val'][selected_nn_idx, :] * weights).sum(dim=1),
@@ -988,7 +1183,8 @@ class SceneModel:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-    def save(self, path: str, reconstruction_time: float = 0, n_frames: int = 0):
+    # def save(self path: str, reconstruction_time: float = 0, n_frames: int = 0):
+    def save(self, path: str, reconstruction_time: float = 0, n_frames: int = 0, save_with_lod_suffix: bool = False):
         # Get metrics
         metrics = {
             "num anchors": len(self.anchors),
@@ -1008,7 +1204,12 @@ class SceneModel:
         pcd_path = os.path.join(path, "point_clouds")
         os.makedirs(pcd_path, exist_ok=True)
         for index, anchor in enumerate(self.anchors):
-            anchor.save_ply(os.path.join(pcd_path, f"anchor_{index}.ply"))
+            if save_with_lod_suffix and hasattr(self, 'current_lod'):
+                anchor_name = f"anchor_{index}_lod_{self.current_lod}.ply"
+            else:
+                anchor_name = f"anchor_{index}.ply"
+            anchor.save_ply(os.path.join(pcd_path, anchor_name))
+
 
         # Save metadata
         metadata = {

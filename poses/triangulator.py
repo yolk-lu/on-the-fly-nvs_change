@@ -96,7 +96,7 @@ class Triangulator():
         uvs_others = torch.rand(n_cams, n_pts, 2, device="cuda")
         Rt = torch.eye(4, device="cuda")
         Rts_others = torch.eye(4, device="cuda")[None].repeat(n_cams, 1, 1)
-        f = torch.rand(1, device="cuda")
+        f = torch.rand(1, device="cuda") + 1e-1 # avoid zero focal length
         centre = torch.rand(2, device="cuda")
         self.max_error = torch.tensor(max_error, device="cuda")
         self.min_dis = torch.tensor(max_error * 30, device="cuda")

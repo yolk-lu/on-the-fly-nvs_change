@@ -27,6 +27,7 @@ class Matches:
 
 # Adapted from https://github.com/verlab/accelerated_features
 def match(feats1, feats2, min_cossim=0.82):
+    # torch.cuda.empty_cache()
     cossim = feats1 @ feats2.t()
 
     bestcossim, match12 = cossim.max(dim=1)
