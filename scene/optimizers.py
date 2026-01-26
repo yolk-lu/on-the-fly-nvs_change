@@ -11,8 +11,15 @@
 
 import torch
 
+# original
 # from diff_gaussian_rasterization import adamUpdate, adamUpdateBasic
-from diff_gaussian_rasterization_SG import adamUpdate, adamUpdateBasic
+
+# for SG only
+# from diff_gaussian_rasterization_SG import adamUpdate, adamUpdateBasic
+
+# for SH-Mix-SG
+
+from diff_gaussian_rasterization_SH_MIX_SG import adamUpdate, adamUpdateBasic
 
 
 class BaseAdam:

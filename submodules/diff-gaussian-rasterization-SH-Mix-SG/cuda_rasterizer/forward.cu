@@ -156,55 +156,135 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	cov3D[5] = Sigma[2][2];
 }
 
-// Forward method for converting the input Spherical Gaussians (SG)
-// coefficients of each Gaussian to a simple RGB color.
-// Layout per lobe (3 vec3s):
-// [0]: Amplitude (RGB)
-// [1]: Axis (XYZ) - will be normalized
-// [2]: Sharpness (X used) - exp(X) is used
-__device__ glm::vec3 computeColorFromSG(int idx, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* dc, const float* shs, bool* clamped)
+// Evaluate SH basis functions Y_lm(dir) for a given direction.
+// Stores results in the provided output array (up to degree 3, 16 coeffs).
+__device__ void evalSHBasis(const glm::vec3 dir, float* result)
 {
-	glm::vec3 pos = means[idx];
-	glm::vec3 dir = pos - campos;
-	dir = dir / glm::length(dir);
+	result[0] = 0.28209479177387814f; // Y_00
 
-	glm::vec3* direct_color = ((glm::vec3*)dc) + idx;
-	glm::vec3* params = ((glm::vec3*)shs) + idx * max_coeffs;
+	float x = dir.x;
+	float y = dir.y;
+	float z = dir.z;
 
-	// Base color (view-independent)
-	glm::vec3 result = SH_C0 * direct_color[0];
+	result[1] = -0.4886025119029199f * y;
+	result[2] = 0.4886025119029199f * z;
+	result[3] = -0.4886025119029199f * x;
 
-	// Each lobe takes 3 vec3s
-	int num_lobes = max_coeffs / 3;
+	float xx = x * x, yy = y * y, zz = z * z;
+	float xy = x * y, yz = y * z, xz = x * z;
+
+	result[4] = 1.0925484305920792f * xy;
+	result[5] = -1.0925484305920792f * yz;
+	result[6] = 0.31539156525252005f * (2.0f * zz - xx - yy);
+	result[7] = -1.0925484305920792f * xz;
+	result[8] = 0.5462742152960396f * (xx - yy);
+
+	result[9] = -0.5900435899266435f * y * (3.0f * xx - yy);
+	result[10] = 2.890611442640554f * xy * z;
+	result[11] = -0.4570457994644658f * y * (4.0f * zz - xx - yy);
+	result[12] = 0.3731763325901154f * z * (2.0f * zz - 3.0f * xx - 3.0f * yy);
+	result[13] = -0.4570457994644658f * x * (4.0f * zz - xx - yy);
+	result[14] = 1.445305721320277f * z * (xx - yy);
+	result[15] = -0.5900435899266435f * x * (xx - 3.0f * yy);
+}
+
+// Evaluate Zonal Harmonic (ZH) coefficient g_{i,l} for a given sharpness lambda and degree l.
+// This approximates the analytic integral of an SG lobe against Legendre Polynomials.
+// Ref: "Differentiable Analytic Projection"
+// Approximation: g_l(lambda) = exp(-l(l+1) / (2 * lambda))
+__device__ float evalZHApprox(int l, float lambda)
+{
+	if (l == 0) return 1.0f - exp(-2.0f * lambda); // Base energy
+	return exp(-(float)(l * (l + 1)) / (2.0f * lambda));
+}
+
+// Convert Spherical Gaussian (SG) parameters to SH coefficients using Analytic Projection.
+// f_lm = Sum_i [ Y_lm(xi_i) * sqrt(4pi/(2l+1)) * g_{i,l} * w_i ]
+// Max supported degree 3 (16 coeffs).
+__device__ void computeSHFromSG(int idx, int max_coeffs_sg, const float* shs, float* result_sh_coeffs)
+{
+	// Initialize SH coeffs to 0
+	for (int i = 0; i < 16 * 3; ++i) result_sh_coeffs[i] = 0.0f;
+
+	// shs points to the start of SG params for this Gaussian
+	// Layout per lobe (7 floats):
+	// [0-2]: Amplitude (RGB)
+	// [3-5]: Axis (XYZ)
+	// [6]: Sharpness (Scalar)
+	const float* params = shs + idx * max_coeffs_sg;
 	
-	for (int i = 0; i < num_lobes; ++i)
+	// Determine number of lobes based on stride 7
+	// If M is not multiple of 7, this implies error or extra padding, but we assume packed 7.
+	int num_lobes = max_coeffs_sg / 7;
+
+	// Temporary storage for SH basis evaluated at lobe axis
+	float basis[16];
+
+	// Constants for Normalization: sqrt(4pi / (2l+1))
+	const float C_norm[4] = {
+		3.544907701811032f,  // l=0: sqrt(4pi)
+		2.046653415892977f,  // l=1: sqrt(4pi/3)
+		1.585330919042404f,  // l=2: sqrt(4pi/5)
+		1.354055224345298f   // l=3: sqrt(4pi/7)
+	};
+
+	for (int k = 0; k < num_lobes; ++k)
 	{
-		glm::vec3 amplitude = params[i * 3 + 0];
-		glm::vec3 axis = params[i * 3 + 1];
-		glm::vec3 sharpness = params[i * 3 + 2];
+		// Offset for current lobe
+		const float* lobe_params = params + k * 7;
+		
+		glm::vec3 amplitude = {lobe_params[0], lobe_params[1], lobe_params[2]};
+		glm::vec3 axis = {lobe_params[3], lobe_params[4], lobe_params[5]};
+		float sharpness = lobe_params[6];
 
 		// Normalize axis
 		float axis_len = glm::length(axis);
 		if (axis_len > 1e-6f)
 			axis = axis / axis_len;
 		
-		// Sharpness (ensure positive)
-		float lambda = exp(sharpness.x);
-		
-		float cosine = glm::dot(dir, axis);
-		
-		// SG value: Amp * exp(lambda * (dot - 1))
-		float weight = exp(lambda * (cosine - 1.0f));
-		result += amplitude * weight;
+		// Evaluate SH basis at lobe axis: Y_lm(xi)
+		evalSHBasis(axis, basis);
+
+		// Sharpness lambda (stored as log scale in sharpness?) 
+		// User code in scene_model just inits 7 dim tensor. 
+		// Usually 3DGS stores "activation" applied later. 
+		// Standard: exp(param) to ensure pos. 
+		float lambda = exp(sharpness);
+
+		// Band 0 (l=0)
+		float g0 = evalZHApprox(0, lambda);
+		float scale0 = C_norm[0] * g0;
+		result_sh_coeffs[0] += amplitude.x * scale0 * basis[0];
+		result_sh_coeffs[16] += amplitude.y * scale0 * basis[0];
+		result_sh_coeffs[32] += amplitude.z * scale0 * basis[0];
+
+		// Band 1 (l=1)
+		float g1 = evalZHApprox(1, lambda);
+		float scale1 = C_norm[1] * g1;
+		for (int i = 1; i <= 3; ++i) {
+			result_sh_coeffs[i] += amplitude.x * scale1 * basis[i];
+			result_sh_coeffs[16 + i] += amplitude.y * scale1 * basis[i];
+			result_sh_coeffs[32 + i] += amplitude.z * scale1 * basis[i];
+		}
+
+		// Band 2 (l=2)
+		float g2 = evalZHApprox(2, lambda);
+		float scale2 = C_norm[2] * g2;
+		for (int i = 4; i <= 8; ++i) {
+			result_sh_coeffs[i] += amplitude.x * scale2 * basis[i];
+			result_sh_coeffs[16 + i] += amplitude.y * scale2 * basis[i];
+			result_sh_coeffs[32 + i] += amplitude.z * scale2 * basis[i];
+		}
+
+		// Band 3 (l=3)
+		float g3 = evalZHApprox(3, lambda);
+		float scale3 = C_norm[3] * g3;
+		for (int i = 9; i <= 15; ++i) {
+			result_sh_coeffs[i] += amplitude.x * scale3 * basis[i];
+			result_sh_coeffs[16 + i] += amplitude.y * scale3 * basis[i];
+			result_sh_coeffs[32 + i] += amplitude.z * scale3 * basis[i];
+		}
 	}
-
-	result += 0.5f;
-
-	// Clamp
-	clamped[3 * idx + 0] = (result.x < 0);
-	clamped[3 * idx + 1] = (result.y < 0);
-	clamped[3 * idx + 2] = (result.z < 0);
-	return glm::max(result, 0.0f);
 }
 
 // Perform initial steps for each Gaussian prior to rasterization.
@@ -307,7 +387,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
-
 	if (colors_precomp == nullptr)
 	{
 		glm::vec3 result;
@@ -315,7 +394,13 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		// If D < 0, use SG
 		if (D < 0)
 		{
-			result = computeColorFromSG(idx, M, (glm::vec3*)orig_points, *cam_pos, dc, shs, clamped);
+			// Local storage for SH coeffs (Degree 3 = 16 floats * 3 channels = 48)
+			float sh_stack[48]; 
+			computeSHFromSG(idx, M, shs, sh_stack);
+			// Pass local SHs to color computer. Degree is implicitly max (3) or derived from M? 
+			// computeColorFromSH takes `deg`. If D<0, we assume D=3 for the SH evaluation? 
+			// Or we pass |D|? Let's assume max degree 3 for now as evalSHBasis supports it.
+			result = computeColorFromSH(idx, 3, M, (glm::vec3*)orig_points, *cam_pos, dc, sh_stack, clamped);
 		}
 		else
 		{

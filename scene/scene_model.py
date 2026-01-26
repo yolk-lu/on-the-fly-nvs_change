@@ -24,7 +24,21 @@ import numpy as np
 
 import lpips
 from fused_ssim import fused_ssim
-from diff_gaussian_rasterization_SG import (
+
+# original
+# from diff_gaussian_rasterization import (
+#     GaussianRasterizationSettings,
+#     GaussianRasterizer,
+# )
+
+# for SG only
+# from diff_gaussian_rasterization_SG import (
+#     GaussianRasterizationSettings,
+#     GaussianRasterizer,
+# )
+
+# for SH-Mix-SG
+from diff_gaussian_rasterization_SH_MIX_SG import (
     GaussianRasterizationSettings,
     GaussianRasterizer,
 )

@@ -143,97 +143,207 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 }
 
-// Backward pass for Spherical Gaussians (SG)
-__device__ void computeColorFromSG(int idx, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* dc, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_ddc, glm::vec3* dL_dshs)
+// Evaluate gradients of SH basis functions Y_lm(dir) w.r.t direction.
+// Result stored as 16 vec3s.
+__device__ void dEvalSHBasis(const glm::vec3 dir, glm::vec3* results)
 {
-	glm::vec3 pos = means[idx];
-	glm::vec3 dir_orig = pos - campos;
-	float dir_len_sq = glm::dot(dir_orig, dir_orig);
-	float dir_len = sqrt(dir_len_sq);
-	glm::vec3 dir = dir_orig / dir_len;
+	// Y00 const, grad 0
+	results[0] = {0.f, 0.f, 0.f};
 
-	glm::vec3* direct_color = ((glm::vec3*)dc) + idx;
-	glm::vec3* params = ((glm::vec3*)shs) + idx * max_coeffs;
+	// Y1m
+	// Y1-1 = -C1*y, Y10 = C1*z, Y11 = -C1*x
+	// grad: (0, -C1, 0), (0, 0, C1), (-C1, 0, 0)
+	float C1 = 0.4886025119029199f;
+	results[1] = {0.f, -C1, 0.f};
+	results[2] = {0.f, 0.f, C1};
+	results[3] = {-C1, 0.f, 0.f};
 
-	// Clamp gradients
-	glm::vec3 dL_dRGB = dL_dcolor[idx];
-	dL_dRGB.x *= clamped[3 * idx + 0] ? 0 : 1;
-	dL_dRGB.y *= clamped[3 * idx + 1] ? 0 : 1;
-	dL_dRGB.z *= clamped[3 * idx + 2] ? 0 : 1;
+	float x = dir.x;
+	float y = dir.y;
+	float z = dir.z;
 
-	// Base color gradient
-	glm::vec3* dL_ddirect_color = dL_ddc + idx;
-	dL_ddirect_color[0] = SH_C0 * dL_dRGB; // SH_C0 scale used in forward for base
+	// Band 2
+	float C2_0 = 1.0925484305920792f;
+	float C2_1 = 1.0925484305920792f;
+	float C2_2 = 0.31539156525252005f;
+	float C2_3 = 1.0925484305920792f;
+	float C2_4 = 0.5462742152960396f;
 
-	glm::vec3* dL_dparams = dL_dshs + idx * max_coeffs;
+	results[4] = {C2_0 * y, C2_0 * x, 0.f}; // xy
+	results[5] = {0.f, -C2_1 * z, -C2_1 * y}; // yz
+	results[6] = {C2_2 * -2.f * x, C2_2 * -2.f * y, C2_2 * 4.f * z}; // 2zz-xx-yy -> d/dx=-2x, d/dz=4z
+	results[7] = {-C2_3 * z, 0.f, -C2_3 * x}; // xz
+	results[8] = {C2_4 * 2.f * x, -C2_4 * 2.f * y, 0.f}; // xx-yy
 
-	glm::vec3 dRGB_ddir = {0.f, 0.f, 0.f};
+	// Band 3
+	// Y3-3, Y3-2, Y3-1, Y30, Y31, Y32, Y33
+	float C3_0 = 0.5900435899266435f;
+	float C3_1 = 2.890611442640554f;
+	float C3_2 = 0.4570457994644658f;
+	float C3_3 = 0.3731763325901154f;
+	float C3_4 = 0.4570457994644658f;
+	float C3_5 = 1.445305721320277f;
+	float C3_6 = 0.5900435899266435f;
 
-	int num_lobes = max_coeffs / 3;
+	float xx = x * x, yy = y * y, zz = z * z;
+	float xy = x * y, yz = y * z, xz = x * z;
 
-	for (int i = 0; i < num_lobes; ++i)
+	// 9: -C3_0 * y * (3xx - yy) = -C3_0 * (3xxy - yyy)
+	// dx: -C3_0 * 6xy, dy: -C3_0 * (3xx - 3yy), dz: 0
+	results[9] = {-C3_0 * 6.f * xy, -C3_0 * 3.f * (xx - yy), 0.f};
+
+	// 10: C3_1 * xyz
+	results[10] = {C3_1 * yz, C3_1 * xz, C3_1 * xy};
+
+	// 11: -C3_2 * y * (4zz - xx - yy)
+	// dx: -C3_2 * y * (-2x) = 2 C3_2 xy
+	// dy: -C3_2 * (4zz - xx - 3yy) 
+	// dz: -C3_2 * y * 8z
+	results[11] = {2.f * C3_2 * xy, -C3_2 * (4.f * zz - xx - 3.f * yy), -8.f * C3_2 * yz};
+
+	// 12: C3_3 * z * (2zz - 3xx - 3yy)
+	// dx: C3_3 * z * (-6x)
+	// dy: C3_3 * z * (-6y)
+	// dz: C3_3 * (6zz - 3xx - 3yy)
+	results[12] = {-6.f * C3_3 * xz, -6.f * C3_3 * yz, C3_3 * (6.f * zz - 3.f * xx - 3.f * yy)};
+
+	// 13: -C3_4 * x * (4zz - xx - yy)
+	// dx: -C3_4 * (4zz - 3xx - yy)
+	// dy: -C3_4 * x * (-2y) = 2 C3_4 xy
+	// dz: -C3_4 * x * 8z
+	results[13] = {-C3_4 * (4.f * zz - 3.f * xx - yy), 2.f * C3_4 * xy, -8.f * C3_4 * xz};
+
+	// 14: C3_5 * z * (xx - yy)
+	// dx: C3_5 * z * 2x
+	// dy: C3_5 * z * (-2y)
+	// dz: C3_5 * (xx - yy)
+	results[14] = {2.f * C3_5 * xz, -2.f * C3_5 * yz, C3_5 * (xx - yy)};
+
+	// 15: -C3_6 * x * (xx - 3yy)
+	// dx: -C3_6 * (3xx - 3yy)
+	// dy: -C3_6 * x * (-6y) = 6 C3_6 xy
+	// dz: 0
+	results[15] = {-C3_6 * 3.f * (xx - yy), 6.f * C3_6 * xy, 0.f};
+}
+
+// Evaluate derivative of g_l(lambda) = exp(-l(l+1)/2lambda)
+// dg/dLambda = g * (l(l+1) / 2 lambda^2)
+__device__ float evalZHApproxGrad(int l, float lambda)
+{
+	if (l == 0) return 2.0f * exp(-2.0f * lambda); // Derivative of 1 - exp(-2L) is 2 exp(-2L)
+	
+	// For l > 0
+	float num = (float)(l * (l + 1));
+	float exponent = -num / (2.0f * lambda);
+	float g = exp(exponent);
+	return g * (num / (2.0f * lambda * lambda));
+}
+
+__device__ float evalZHApproxVal(int l, float lambda)
+{
+    if (l == 0) return 1.0f - exp(-2.0f * lambda);
+    return exp(-(float)(l * (l + 1)) / (2.0f * lambda));
+}
+
+// Backward pass: Propagate gradients from SH coefficients to SG parameters.
+// dL_dshs contains the accumulated gradients on the SH coefficients C_lm.
+// We need to compute dL_dSG = sum ( dL/dC_lm * dC_lm/dSG )
+__device__ void computeSGIGrad(int idx, int max_coeffs_sg, const float* shs, const float* dL_dsh_coeffs, float* dL_dshs_sg)
+{
+	// Params: SG parameters (Forward)
+	const float* params = shs + idx * max_coeffs_sg;
+	
+	// dL_dparams: SG parameter gradients (Backward Output)
+	// Cast result buffer to float* to match signature (Wait, signature above takes glm::vec3* usually? No, let's fix signature to float*)
+	// But `preprocessCUDA` calls it. `dL_dsh` in preprocess is `float*`. 
+	// However, `computeSGIGrad` definition in this file previously had `glm::vec3*`.
+	// We should change it to `float*` for flexibility with stride 7.
+	float* dL_dparams = dL_dshs_sg + idx * max_coeffs_sg;
+	
+	int num_lobes = max_coeffs_sg / 7;
+
+	// Temp storage for Y_lm(axis) and Grad Y_lm(axis)
+	float basis[16];
+	glm::vec3 components_grad[16];
+
+	// Constants for Normalization: sqrt(4pi / (2l+1))
+	const float C_norm[4] = {
+		3.544907701811032f, 2.046653415892977f, 1.585330919042404f, 1.354055224345298f
+	};
+
+	// Start indices for each band
+	const int band_start[] = {0, 1, 4, 9};
+	const int band_end[] = {0, 3, 8, 15};
+
+	for (int k = 0; k < num_lobes; ++k)
 	{
-		glm::vec3 amplitude = params[i * 3 + 0];
-		glm::vec3 axis = params[i * 3 + 1];
-		glm::vec3 sharpness = params[i * 3 + 2];
+		const float* lobe_params = params + k * 7;
+		float* lobe_grads = dL_dparams + k * 7;
 
-		// Forward auxiliary calc to get intermediate values
+		glm::vec3 amplitude = {lobe_params[0], lobe_params[1], lobe_params[2]};
+		glm::vec3 axis = {lobe_params[3], lobe_params[4], lobe_params[5]};
+		float sharpness = lobe_params[6];
+
 		float axis_len = glm::length(axis);
 		glm::vec3 axis_norm = axis;
-		if (axis_len > 1e-6f) axis_norm = axis / axis_len;
-
-		float lambda = exp(sharpness.x);
-		float cosine = glm::dot(dir, axis_norm);
-		float weight = exp(lambda * (cosine - 1.0f));
-
-		// --- Gradients ---
-
-		// 1. Amplitude
-		// result += amplitude * weight
-		// dL_dAmp = dL_dRGB * weight
-		dL_dparams[i * 3 + 0] = dL_dRGB * weight;
-
-		// 2. Sharpness (lambda)
-		// weight = exp(lambda * (cosine - 1))
-		// dWeight_dLambda = weight * (cosine - 1)
-		// lambda = exp(sharpness.x)
-		// dLambda_dSharpnessX = lambda
-		// dL_dSharpnessX = dot(dL_dRGB, amplitude) * dWeight_dLambda * dLambda_dSharpnessX
-		float dL_dweight = glm::dot(dL_dRGB, amplitude);
-		float dWeight_dLambda = weight * (cosine - 1.0f);
-		float dL_dLambda = dL_dweight * dWeight_dLambda;
-		float dL_dSharpnessX = dL_dLambda * lambda;
-		dL_dparams[i * 3 + 2] = {dL_dSharpnessX, 0.f, 0.f}; // Only X used
-
-		// 3. Axis & Dir (Cosine)
-		// weight = exp(lambda * (cosine - 1))
-		// dWeight_dCosine = weight * lambda
-		float dL_dCosine = dL_dweight * weight * lambda; // dot(dL_dRGB, Amp) * weight * lambda
+		if (axis_len > 1e-6f)
+			axis_norm = axis / axis_len;
 		
-		// cosine = dot(dir, axis_norm)
-		// dCosine_dDir = axis_norm
-		// dCosine_dAxisNorm = dir
-		dRGB_ddir += dL_dCosine * axis_norm; // Accumulate gradient to view direction
+		evalSHBasis(axis_norm, basis);
+		dEvalSHBasis(axis_norm, components_grad);
+		
+		float s = sharpness; // stored as log lambda
+		float lambda = exp(s); // lambda
 
-		glm::vec3 dL_dAxisNorm = dL_dCosine * dir;
+		glm::vec3 dL_dA = {0.f, 0.f, 0.f};
+		glm::vec3 dL_dAxisNorm = {0.f, 0.f, 0.f};
+		float dL_dLambda = 0.f;
 
-		// Backprop through normalization
-		// axis_norm = axis / len
-		// d(axis_norm)/d(axis) = (I - axis_norm * axis_norm^T) / len
+		const glm::vec3* dL_dC = (const glm::vec3*)dL_dsh_coeffs;
+
+		// Iterate over bands 0 to 3
+		for (int l = 0; l <= 3; ++l) {
+			float g = evalZHApproxVal(l, lambda);
+			float dg = evalZHApproxGrad(l, lambda);
+			float scale = C_norm[l];
+			
+			for (int i = band_start[l]; i <= band_end[l]; ++i) {
+				// f_lm = A * scale * g * Y
+				// dL/dA += dL/df * scale * g * Y
+				// dL/dLambda += dot(dL/df, A) * scale * dg * Y
+				// dL/dAxis += dot(dL/df, A) * scale * g * dY/dAxis
+				
+				glm::vec3 grad_f = dL_dC[i]; 
+				float Y = basis[i];
+				glm::vec3 dY = components_grad[i];
+
+				dL_dA += grad_f * (scale * g * Y);
+				dL_dLambda += glm::dot(grad_f, amplitude) * (scale * dg * Y);
+				dL_dAxisNorm += glm::dot(grad_f, amplitude) * (scale * g) * dY;
+			}
+		}
+
+		// Propagate to parameters (Respect stride 7)
+		lobe_grads[0] = dL_dA.x;
+		lobe_grads[1] = dL_dA.y;
+		lobe_grads[2] = dL_dA.z;
+		
+		// Axis gradient (backprop normalization)
+		glm::vec3 dL_dAxis = {0.f, 0.f, 0.f};
 		if (axis_len > 1e-6f) {
 			glm::vec3 term = dL_dAxisNorm / axis_len;
-			glm::vec3 axis_grad = term - axis_norm * glm::dot(axis_norm, term);
-			dL_dparams[i * 3 + 1] = axis_grad;
-		} else {
-			dL_dparams[i * 3 + 1] = {0.f, 0.f, 0.f};
+			dL_dAxis = term - axis_norm * glm::dot(axis_norm, term);
 		}
-	}
+		lobe_grads[3] = dL_dAxis.x;
+		lobe_grads[4] = dL_dAxis.y;
+		lobe_grads[5] = dL_dAxis.z;
 
-	// Propagate dRGB_ddir to dL_dmeans
-	// dL_dmean = dnormvdv(dir_orig, dRGB_ddir)
-	float3 dL_dmean = dnormvdv(float3{ dir_orig.x, dir_orig.y, dir_orig.z }, float3{ dRGB_ddir.x, dRGB_ddir.y, dRGB_ddir.z });
-	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
+		// Sharpness s gradient: dL/ds = dL/dlambda * dlambda/ds = dL/dlambda * lambda
+		float dL_ds = dL_dLambda * lambda;
+		lobe_grads[6] = dL_ds;
+	}
 }
+
 
 // Backward version of INVERSE 2D covariance matrix computation
 // (due to length launched as separate kernel before other 
@@ -574,7 +684,45 @@ __global__ void preprocessCUDA(
 	{
 		if (D < 0)
 		{
-			computeColorFromSG(idx, M, (glm::vec3*)means, *campos, dc, shs, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_ddc, (glm::vec3*)dL_dsh);
+			// Local SH gradient buffer (48 floats)
+			float dL_dsh_local[48];
+			// Initialize local gradients to 0 as computeColorFromSH accumulates
+			for (int i=0; i<48; ++i) dL_dsh_local[i] = 0.f;
+
+			// 1. Backprop from Color to SH coeffs
+			// We pass a dummy SH pointer (shs) or our local sh buffer? 
+			// Wait, computeColorFromSH needs the FORWARD SH coeffs to compute gradients? 
+			// Yes: `float* sh = ((glm::vec3*)shs) + ...`
+			// But in SG mode, `shs` contains SG params, not SH coeffs.
+			// So we must RECOMPUTE forward SH coeffs here locally first!
+			
+			float sh_forward_local[48];
+			computeSHFromSG(idx, M, shs, sh_forward_local);
+
+			// Now call computeColorFromSH using LOCAL forward SHs and LOCAL gradient buffer
+			// Be careful: the function signature expects global pointers, but we pass local addresses.
+			// We cast local array to pointers. 
+			// Arguments: idx is irrelevant for local array access if we manage pointers correctly?
+			// `computeColorFromSH` adds `idx * max_coeffs` to the pointer.
+			// If we pass `sh_forward_local`, it will try to access `sh_forward_local + idx*...` -> SEGFAULT.
+			// We must modify `computeColorFromSH` to accept a flexible pointer OR adjust the pointer we pass.
+			// Hack: pass `sh_forward_local - idx * max_coeffs`. 
+			// Since `sh_forward_local` is local register/shared mem, this pointer arithmetic is valid virtual address.
+			// BUT `max_coeffs` in SH mode is 16 (for deg 3). `M` passed in might be SG size?
+			// `ext.cpp` passes `M = sh.size(1)` which is SG params count.
+			// We need to pass `max_coeffs=16` (number of vec3 SH coeffs) to computeColorFromSH.
+			
+			int max_coeffs_sh = 16;
+			glm::vec3* sh_ptr = (glm::vec3*)sh_forward_local - idx * max_coeffs_sh;
+			glm::vec3* dL_dsh_ptr = (glm::vec3*)dL_dsh_local - idx * max_coeffs_sh;
+
+			// Use Degree 3 hardcoded for SG mode
+			computeColorFromSH(idx, 3, max_coeffs_sh, (glm::vec3*)means, *campos, dc, (float*)sh_ptr, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_ddc, (glm::vec3*)dL_dsh_ptr);
+
+			// 2. Backprop from SH coeffs to SG params
+			// dL_dsh_local now contains gradients w.r.t SH coefficients.
+			// We need to propagate this to dL_dsh (which points to global SG gradients).
+			computeSGIGrad(idx, M, shs, dL_dsh_local, dL_dsh);
 		}
 		else
 		{
