@@ -307,6 +307,150 @@ throw std::runtime_error(cudaGetErrorString(ret)); \
 // Convert Spherical Gaussian (SG) parameters to SH coefficients using Analytic Projection.
 // f_lm = Sum_i [ Y_lm(xi_i) * sqrt(4pi/(2l+1)) * g_{i,l} * w_i ]
 // Max supported degree 3 (16 coeffs).
+
+// Evaluate SH sum for a given direction (Color Evaluation)
+// DC is the first coefficient (Band 0).
+// shs points to Band 1 coefficients (vec3 array).
+// Result is linear RGB (before clamping).
+__forceinline__ __device__ glm::vec3 evalSHColor(const glm::vec3 dir, const glm::vec3 dc, const glm::vec3* shs, int deg)
+{
+	glm::vec3 result = SH_C0 * dc;
+	if (deg > 0)
+	{
+		float x = dir.x;
+		float y = dir.y;
+		float z = dir.z;
+		result = result - SH_C1 * SH_W1 * y * shs[0] + SH_C1 * SH_W1 * z * shs[1] - SH_C1 * SH_W1 * x * shs[2];
+
+		if (deg > 1)
+		{
+			float xx = x * x, yy = y * y, zz = z * z;
+			float xy = x * y, yz = y * z, xz = x * z;
+			result = result +
+				SH_C2[0] * SH_W2 * xy * shs[3] +
+				SH_C2[1] * SH_W2 * yz * shs[4] +
+				SH_C2[2] * SH_W2 * (2.0f * zz - xx - yy) * shs[5] +
+				SH_C2[3] * SH_W2 * xz * shs[6] +
+				SH_C2[4] * SH_W2 * (xx - yy) * shs[7];
+
+			if (deg > 2)
+			{
+				result = result +
+					SH_C3[0] * SH_W3 * y * (3.0f * xx - yy) * shs[8] +
+					SH_C3[1] * SH_W3 * xy * z * shs[9] +
+					SH_C3[2] * SH_W3 * y * (4.0f * zz - xx - yy) * shs[10] +
+					SH_C3[3] * SH_W3 * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * shs[11] +
+					SH_C3[4] * SH_W3 * x * (4.0f * zz - xx - yy) * shs[12] +
+					SH_C3[5] * SH_W3 * z * (xx - yy) * shs[13] +
+					SH_C3[6] * SH_W3 * x * (xx - 3.0f * yy) * shs[14];
+			}
+		}
+	}
+	result += 0.5f;
+	return result; 
+}
+
+// Evaluate gradients for SH color (Backward Pass)
+// dL_dRGB: Gradient of loss w.r.t Color
+// dir: View direction
+// shs: Forward SH coefficients (Band 1, vec3*)
+// dL_ddc: Gradient w.r.t DC (Output)
+// dL_dshs: Gradient w.r.t SH (Band 1, vec3* Output)
+// dRGBdx, dRGBdy, dRGBdz: Gradient of Color w.r.t direction (Output, accumulated)
+__forceinline__ __device__ void dEvalSHColor(
+	const glm::vec3 dL_dRGB, 
+	const glm::vec3 dir, 
+	const glm::vec3* shs, 
+	int deg,
+	glm::vec3& dL_ddc,
+	glm::vec3* dL_dshs,
+	glm::vec3& dRGBdx, glm::vec3& dRGBdy, glm::vec3& dRGBdz)
+{
+	// No tricks here, just high school-level calculus.
+	float dRGBdsh0 = SH_C0;
+	dL_ddc = dRGBdsh0 * dL_dRGB;
+	
+	if (deg > 0)
+	{
+		float x = dir.x; float y = dir.y; float z = dir.z;
+		
+		float dRGBdsh1 = -SH_C1 * SH_W1 * y;
+		float dRGBdsh2 = SH_C1 * SH_W1 * z;
+		float dRGBdsh3 = -SH_C1 * SH_W1 * x;
+		dL_dshs[0] = dRGBdsh1 * dL_dRGB;
+		dL_dshs[1] = dRGBdsh2 * dL_dRGB;
+		dL_dshs[2] = dRGBdsh3 * dL_dRGB;
+
+		dRGBdx = -SH_C1 * SH_W1 * shs[2]; // sh[2] is shs[2]
+		dRGBdy = -SH_C1 * SH_W1 * shs[0];
+		dRGBdz = SH_C1 * SH_W1 * shs[1];
+
+		if (deg > 1)
+		{
+			float xx = x * x, yy = y * y, zz = z * z;
+			float xy = x * y, yz = y * z, xz = x * z;
+
+			float dRGBdsh4 = SH_C2[0] * SH_W2 * xy;
+			float dRGBdsh5 = SH_C2[1] * SH_W2 * yz;
+			float dRGBdsh6 = SH_C2[2] * SH_W2 * (2.f * zz - xx - yy);
+			float dRGBdsh7 = SH_C2[3] * SH_W2 * xz;
+			float dRGBdsh8 = SH_C2[4] * SH_W2 * (xx - yy);
+			dL_dshs[3] = dRGBdsh4 * dL_dRGB;
+			dL_dshs[4] = dRGBdsh5 * dL_dRGB;
+			dL_dshs[5] = dRGBdsh6 * dL_dRGB;
+			dL_dshs[6] = dRGBdsh7 * dL_dRGB;
+			dL_dshs[7] = dRGBdsh8 * dL_dRGB;
+
+			dRGBdx += SH_C2[0] * SH_W2 * y * shs[3] + SH_C2[2] * SH_W2 * 2.f * -x * shs[5] + SH_C2[3] * SH_W2 * z * shs[6] + SH_C2[4] * SH_W2 * 2.f * x * shs[7];
+			dRGBdy += SH_C2[0] * SH_W2 * x * shs[3] + SH_C2[1] * SH_W2 * z * shs[4] + SH_C2[2] * SH_W2 * 2.f * -y * shs[5] + SH_C2[4] * SH_W2 * 2.f * -y * shs[7];
+			dRGBdz += SH_C2[1] * SH_W2 * y * shs[4] + SH_C2[2] * SH_W2 * 2.f * 2.f * z * shs[5] + SH_C2[3] * SH_W2 * x * shs[6];
+
+			if (deg > 2)
+			{
+				float dRGBdsh9 = SH_C3[0] * SH_W3 * y * (3.f * xx - yy);
+				float dRGBdsh10 = SH_C3[1] * SH_W3 * xy * z;
+				float dRGBdsh11 = SH_C3[2] * SH_W3 * y * (4.f * zz - xx - yy);
+				float dRGBdsh12 = SH_C3[3] * SH_W3 * z * (2.f * zz - 3.f * xx - 3.f * yy);
+				float dRGBdsh13 = SH_C3[4] * SH_W3 * x * (4.f * zz - xx - yy);
+				float dRGBdsh14 = SH_C3[5] * SH_W3 * z * (xx - yy);
+				float dRGBdsh15 = SH_C3[6] * SH_W3 * x * (xx - 3.f * yy);
+				dL_dshs[8] = dRGBdsh9 * dL_dRGB;
+				dL_dshs[9] = dRGBdsh10 * dL_dRGB;
+				dL_dshs[10] = dRGBdsh11 * dL_dRGB;
+				dL_dshs[11] = dRGBdsh12 * dL_dRGB;
+				dL_dshs[12] = dRGBdsh13 * dL_dRGB;
+				dL_dshs[13] = dRGBdsh14 * dL_dRGB;
+				dL_dshs[14] = dRGBdsh15 * dL_dRGB;
+
+				dRGBdx += (
+					SH_C3[0] * SH_W3 * shs[8] * 3.f * 2.f * xy +
+					SH_C3[1] * SH_W3 * shs[9] * yz +
+					SH_C3[2] * SH_W3 * shs[10] * -2.f * xy +
+					SH_C3[3] * SH_W3 * shs[11] * -3.f * 2.f * xz +
+					SH_C3[4] * SH_W3 * shs[12] * (-3.f * xx + 4.f * zz - yy) +
+					SH_C3[5] * SH_W3 * shs[13] * 2.f * xz +
+					SH_C3[6] * SH_W3 * shs[14] * 3.f * (xx - yy));
+
+				dRGBdy += (
+					SH_C3[0] * SH_W3 * shs[8] * 3.f * (xx - yy) +
+					SH_C3[1] * SH_W3 * shs[9] * xz +
+					SH_C3[2] * SH_W3 * shs[10] * (-3.f * yy + 4.f * zz - xx) +
+					SH_C3[3] * SH_W3 * shs[11] * -3.f * 2.f * yz +
+					SH_C3[4] * SH_W3 * shs[12] * -2.f * xy +
+					SH_C3[5] * SH_W3 * shs[13] * -2.f * yz +
+					SH_C3[6] * SH_W3 * shs[14] * -3.f * 2.f * xy);
+
+				dRGBdz += (
+					SH_C3[1] * SH_W3 * shs[9] * xy +
+					SH_C3[2] * SH_W3 * shs[10] * 4.f * 2.f * yz +
+					SH_C3[3] * SH_W3 * shs[11] * 3.f * (2.f * zz - xx - yy) +
+					SH_C3[4] * SH_W3 * shs[12] * 4.f * 2.f * xz +
+					SH_C3[5] * SH_W3 * shs[13] * (xx - yy));
+			}
+		}
+	}
+}
+
 __forceinline__ __device__ void computeSHFromSG(int idx, int max_coeffs_sg, const float* shs, float* result_sh_coeffs)
 {
 	// Initialize SH coeffs to 0
@@ -361,34 +505,34 @@ __forceinline__ __device__ void computeSHFromSG(int idx, int max_coeffs_sg, cons
 		float g0 = evalZHApprox(0, lambda);
 		float scale0 = C_norm[0] * g0;
 		result_sh_coeffs[0] += amplitude.x * scale0 * basis[0];
-		result_sh_coeffs[16] += amplitude.y * scale0 * basis[0];
-		result_sh_coeffs[32] += amplitude.z * scale0 * basis[0];
+		result_sh_coeffs[1] += amplitude.y * scale0 * basis[0];
+		result_sh_coeffs[2] += amplitude.z * scale0 * basis[0];
 
 		// Band 1 (l=1)
 		float g1 = evalZHApprox(1, lambda);
 		float scale1 = C_norm[1] * g1;
 		for (int i = 1; i <= 3; ++i) {
-			result_sh_coeffs[i] += amplitude.x * scale1 * basis[i];
-			result_sh_coeffs[16 + i] += amplitude.y * scale1 * basis[i];
-			result_sh_coeffs[32 + i] += amplitude.z * scale1 * basis[i];
+			result_sh_coeffs[i * 3 + 0] += amplitude.x * scale1 * basis[i];
+			result_sh_coeffs[i * 3 + 1] += amplitude.y * scale1 * basis[i];
+			result_sh_coeffs[i * 3 + 2] += amplitude.z * scale1 * basis[i];
 		}
 
 		// Band 2 (l=2)
 		float g2 = evalZHApprox(2, lambda);
 		float scale2 = C_norm[2] * g2;
 		for (int i = 4; i <= 8; ++i) {
-			result_sh_coeffs[i] += amplitude.x * scale2 * basis[i];
-			result_sh_coeffs[16 + i] += amplitude.y * scale2 * basis[i];
-			result_sh_coeffs[32 + i] += amplitude.z * scale2 * basis[i];
+			result_sh_coeffs[i * 3 + 0] += amplitude.x * scale2 * basis[i];
+			result_sh_coeffs[i * 3 + 1] += amplitude.y * scale2 * basis[i];
+			result_sh_coeffs[i * 3 + 2] += amplitude.z * scale2 * basis[i];
 		}
 
 		// Band 3 (l=3)
 		float g3 = evalZHApprox(3, lambda);
 		float scale3 = C_norm[3] * g3;
 		for (int i = 9; i <= 15; ++i) {
-			result_sh_coeffs[i] += amplitude.x * scale3 * basis[i];
-			result_sh_coeffs[16 + i] += amplitude.y * scale3 * basis[i];
-			result_sh_coeffs[32 + i] += amplitude.z * scale3 * basis[i];
+			result_sh_coeffs[i * 3 + 0] += amplitude.x * scale3 * basis[i];
+			result_sh_coeffs[i * 3 + 1] += amplitude.y * scale3 * basis[i];
+			result_sh_coeffs[i * 3 + 2] += amplitude.z * scale3 * basis[i];
 		}
 	}
 }

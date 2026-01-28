@@ -48,86 +48,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	glm::vec3* dL_ddirect_color = dL_ddc + idx;
 	glm::vec3* dL_dsh = dL_dshs + idx * max_coeffs;
 
-	// No tricks here, just high school-level calculus.
-	float dRGBdsh0 = SH_C0;
-	dL_ddirect_color[0] = dRGBdsh0 * dL_dRGB;
-	if (deg > 0)
-	{
-		float dRGBdsh1 = -SH_C1 * SH_W1 * y;
-		float dRGBdsh2 = SH_C1 * SH_W1 * z;
-		float dRGBdsh3 = -SH_C1 * SH_W1 * x;
-		dL_dsh[0] = dRGBdsh1 * dL_dRGB;
-		dL_dsh[1] = dRGBdsh2 * dL_dRGB;
-		dL_dsh[2] = dRGBdsh3 * dL_dRGB;
-
-		dRGBdx = -SH_C1 * SH_W1 * sh[2];
-		dRGBdy = -SH_C1 * SH_W1 * sh[0];
-		dRGBdz = SH_C1 * SH_W1 * sh[1];
-
-		if (deg > 1)
-		{
-			float xx = x * x, yy = y * y, zz = z * z;
-			float xy = x * y, yz = y * z, xz = x * z;
-
-			float dRGBdsh4 = SH_C2[0] * SH_W2 * xy;
-			float dRGBdsh5 = SH_C2[1] * SH_W2 * yz;
-			float dRGBdsh6 = SH_C2[2] * SH_W2 * (2.f * zz - xx - yy);
-			float dRGBdsh7 = SH_C2[3] * SH_W2 * xz;
-			float dRGBdsh8 = SH_C2[4] * SH_W2 * (xx - yy);
-			dL_dsh[3] = dRGBdsh4 * dL_dRGB;
-			dL_dsh[4] = dRGBdsh5 * dL_dRGB;
-			dL_dsh[5] = dRGBdsh6 * dL_dRGB;
-			dL_dsh[6] = dRGBdsh7 * dL_dRGB;
-			dL_dsh[7] = dRGBdsh8 * dL_dRGB;
-
-			dRGBdx += SH_C2[0] * SH_W2 * y * sh[3] + SH_C2[2] * SH_W2 * 2.f * -x * sh[5] + SH_C2[3] * SH_W2 * z * sh[6] + SH_C2[4] * SH_W2 * 2.f * x * sh[7];
-			dRGBdy += SH_C2[0] * SH_W2 * x * sh[3] + SH_C2[1] * SH_W2 * z * sh[4] + SH_C2[2] * SH_W2 * 2.f * -y * sh[5] + SH_C2[4] * SH_W2 * 2.f * -y * sh[7];
-			dRGBdz += SH_C2[1] * SH_W2 * y * sh[4] + SH_C2[2] * SH_W2 * 2.f * 2.f * z * sh[5] + SH_C2[3] * SH_W2 * x * sh[6];
-
-			if (deg > 2)
-			{
-				float dRGBdsh9 = SH_C3[0] * SH_W3 * y * (3.f * xx - yy);
-				float dRGBdsh10 = SH_C3[1] * SH_W3 * xy * z;
-				float dRGBdsh11 = SH_C3[2] * SH_W3 * y * (4.f * zz - xx - yy);
-				float dRGBdsh12 = SH_C3[3] * SH_W3 * z * (2.f * zz - 3.f * xx - 3.f * yy);
-				float dRGBdsh13 = SH_C3[4] * SH_W3 * x * (4.f * zz - xx - yy);
-				float dRGBdsh14 = SH_C3[5] * SH_W3 * z * (xx - yy);
-				float dRGBdsh15 = SH_C3[6] * SH_W3 * x * (xx - 3.f * yy);
-				dL_dsh[8] = dRGBdsh9 * dL_dRGB;
-				dL_dsh[9] = dRGBdsh10 * dL_dRGB;
-				dL_dsh[10] = dRGBdsh11 * dL_dRGB;
-				dL_dsh[11] = dRGBdsh12 * dL_dRGB;
-				dL_dsh[12] = dRGBdsh13 * dL_dRGB;
-				dL_dsh[13] = dRGBdsh14 * dL_dRGB;
-				dL_dsh[14] = dRGBdsh15 * dL_dRGB;
-
-				dRGBdx += (
-					SH_C3[0] * SH_W3 * sh[8] * 3.f * 2.f * xy +
-					SH_C3[1] * SH_W3 * sh[9] * yz +
-					SH_C3[2] * SH_W3 * sh[10] * -2.f * xy +
-					SH_C3[3] * SH_W3 * sh[11] * -3.f * 2.f * xz +
-					SH_C3[4] * SH_W3 * sh[12] * (-3.f * xx + 4.f * zz - yy) +
-					SH_C3[5] * SH_W3 * sh[13] * 2.f * xz +
-					SH_C3[6] * SH_W3 * sh[14] * 3.f * (xx - yy));
-
-				dRGBdy += (
-					SH_C3[0] * SH_W3 * sh[8] * 3.f * (xx - yy) +
-					SH_C3[1] * SH_W3 * sh[9] * xz +
-					SH_C3[2] * SH_W3 * sh[10] * (-3.f * yy + 4.f * zz - xx) +
-					SH_C3[3] * SH_W3 * sh[11] * -3.f * 2.f * yz +
-					SH_C3[4] * SH_W3 * sh[12] * -2.f * xy +
-					SH_C3[5] * SH_W3 * sh[13] * -2.f * yz +
-					SH_C3[6] * SH_W3 * sh[14] * -3.f * 2.f * xy);
-
-				dRGBdz += (
-					SH_C3[1] * SH_W3 * sh[9] * xy +
-					SH_C3[2] * SH_W3 * sh[10] * 4.f * 2.f * yz +
-					SH_C3[3] * SH_W3 * sh[11] * 3.f * (2.f * zz - xx - yy) +
-					SH_C3[4] * SH_W3 * sh[12] * 4.f * 2.f * xz +
-					SH_C3[5] * SH_W3 * sh[13] * (xx - yy));
-			}
-		}
-	}
+	dEvalSHColor(dL_dRGB, dir, sh, deg, *dL_ddirect_color, dL_dsh, dRGBdx, dRGBdy, dRGBdz);
 
 	// The view direction is an input to the computation. View direction
 	// is influenced by the Gaussian's mean, so SHs gradients
@@ -592,31 +513,41 @@ __global__ void preprocessCUDA(
 			computeSHFromSG(idx, M, shs, sh_forward_local);
 
 			// Extract DC (Band 0) from the first 3 floats (Interleaved R, G, B)
+			// Extract DC (Band 0) from the first 3 floats (Interleaved R, G, B)
 			glm::vec3 val_dc = {sh_forward_local[0], sh_forward_local[1], sh_forward_local[2]};
-			glm::vec3* dc_ptr_local = &val_dc;
-			glm::vec3* dc_ptr_adjusted = dc_ptr_local - idx;
 
-			// Now call computeColorFromSH using LOCAL forward SHs and LOCAL gradient buffer
-			// computeColorFromSH adds `idx * max_coeffs` to the pointer.
-			// We must subtract it to access local stack correctly.
-			
-			int max_coeffs_sh = 16;
-			
 			// SH Pointer (Band 1 starts at offset 3 floats)
 			glm::vec3* sh_ptr_local = (glm::vec3*)(sh_forward_local + 3);
-			glm::vec3* sh_ptr_adjusted = sh_ptr_local - idx * max_coeffs_sh;
 			
 			// Gradient Pointer (Band 1 starts at offset 3 floats)
 			glm::vec3* dL_dsh_ptr_local = (glm::vec3*)(dL_dsh_local + 3);
-			glm::vec3* dL_dsh_ptr_adjusted = dL_dsh_ptr_local - idx * max_coeffs_sh;
 
 			// DC Gradient (Local variable)
 			glm::vec3 dL_ddc_val = {0.f, 0.f, 0.f};
-			glm::vec3* dL_ddc_ptr_local = &dL_ddc_val;
-			glm::vec3* dL_ddc_ptr_adjusted = dL_ddc_ptr_local - idx;
 
-			// Use Degree 3 hardcoded for SG mode
-			computeColorFromSH(idx, 3, max_coeffs_sh, (glm::vec3*)means, *campos, (float*)dc_ptr_adjusted, (float*)sh_ptr_adjusted, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_ddc_ptr_adjusted, (glm::vec3*)dL_dsh_ptr_adjusted);
+			// Gradient accumulation variables
+			glm::vec3 dRGBdx(0, 0, 0);
+			glm::vec3 dRGBdy(0, 0, 0);
+			glm::vec3 dRGBdz(0, 0, 0);
+
+			// Compute dL_dRGB same as computeColorFromSH (clamping)
+			glm::vec3 dL_dRGB = dL_dcolor[idx];
+			dL_dRGB.x *= clamped[3 * idx + 0] ? 0 : 1;
+			dL_dRGB.y *= clamped[3 * idx + 1] ? 0 : 1;
+			dL_dRGB.z *= clamped[3 * idx + 2] ? 0 : 1;
+
+			// Compute direction
+			glm::vec3 pos = means[idx];
+			glm::vec3 dir_orig = pos - *campos;
+			glm::vec3 dir = dir_orig / glm::length(dir_orig);
+
+			// Call dEvalSHColor directly with local vars
+			dEvalSHColor(dL_dRGB, dir, sh_ptr_local, 3, dL_ddc_val, dL_dsh_ptr_local, dRGBdx, dRGBdy, dRGBdz);
+
+			// Update accumulated gradients for mean
+			glm::vec3 dL_ddir(glm::dot(dRGBdx, dL_dRGB), glm::dot(dRGBdy, dL_dRGB), glm::dot(dRGBdz, dL_dRGB));
+			float3 dL_dmean = dnormvdv(float3{ dir_orig.x, dir_orig.y, dir_orig.z }, float3{ dL_ddir.x, dL_ddir.y, dL_ddir.z });
+			dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 
 			// Put DC gradient back into dL_dsh_local (Interleaved Band 0)
 			dL_dsh_local[0] = dL_ddc_val.x;

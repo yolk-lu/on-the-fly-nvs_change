@@ -32,40 +32,9 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 
 	glm::vec3* direct_color = ((glm::vec3*)dc) + idx;
 	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;
-	glm::vec3 result = SH_C0 * direct_color[0];
+	
+	glm::vec3 result = evalSHColor(dir, direct_color[0], sh, deg);
 
-	if (deg > 0)
-	{
-		float x = dir.x;
-		float y = dir.y;
-		float z = dir.z;
-		result = result - SH_C1 * SH_W1 * y * sh[0] + SH_C1 * SH_W1 * z * sh[1] - SH_C1 * SH_W1 * x * sh[2];
-
-		if (deg > 1)
-		{
-			float xx = x * x, yy = y * y, zz = z * z;
-			float xy = x * y, yz = y * z, xz = x * z;
-			result = result +
-				SH_C2[0] * SH_W2 * xy * sh[3] +
-				SH_C2[1] * SH_W2 * yz * sh[4] +
-				SH_C2[2] * SH_W2 * (2.0f * zz - xx - yy) * sh[5] +
-				SH_C2[3] * SH_W2 * xz * sh[6] +
-				SH_C2[4] * SH_W2 * (xx - yy) * sh[7];
-
-			if (deg > 2)
-			{
-				result = result +
-					SH_C3[0] * SH_W3 * y * (3.0f * xx - yy) * sh[8] +
-					SH_C3[1] * SH_W3 * xy * z * sh[9] +
-					SH_C3[2] * SH_W3 * y * (4.0f * zz - xx - yy) * sh[10] +
-					SH_C3[3] * SH_W3 * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[11] +
-					SH_C3[4] * SH_W3 * x * (4.0f * zz - xx - yy) * sh[12] +
-					SH_C3[5] * SH_W3 * z * (xx - yy) * sh[13] +
-					SH_C3[6] * SH_W3 * x * (xx - 3.0f * yy) * sh[14];
-			}
-		}
-	}
-	result += 0.5f;
 
 	// RGB colors are clamped to positive values. If values are
 	// clamped, we need to keep track of this for the backward pass.
@@ -272,17 +241,21 @@ __global__ void preprocessCUDA(int P, int D, int M,
 			// Extract DC (Band 0) from the first 3 floats (Interleaved R, G, B)
 			glm::vec3 val_dc = {sh_stack[0], sh_stack[1], sh_stack[2]};
 			
-			// Adjust DC pointer because computeColorFromSH adds idx
-			glm::vec3* dc_ptr_local = &val_dc;
-			glm::vec3* dc_ptr_adjusted = dc_ptr_local - idx;
+			glm::vec3* sh_start_ptr = (glm::vec3*)(sh_stack + 3);
 
-			// Pass local SHs to color computer starting from Band 1 (offset 3 floats == 1 vec3)
-			// computeColorFromSH adds `idx * 16` (max_coeffs) to the pointer. We must subtract it to access local stack correctly.
-			glm::vec3* sh_ptr_local = (glm::vec3*)(sh_stack + 3);
-			glm::vec3* sh_ptr_adjusted = sh_ptr_local - idx * 16;
+			// Compute Color using pure local function call
+			// Need to compute direction here same as computeColorFromSH
+			glm::vec3 pos = ((glm::vec3*)orig_points)[idx];
+			glm::vec3 dir = pos - *cam_pos;
+			dir = dir / glm::length(dir);
+
+			result = evalSHColor(dir, val_dc, sh_start_ptr, 3);
 			
-			// We pass deg=3. Max coeffs=16 (vec3s).
-			result = computeColorFromSH(idx, 3, 16, (glm::vec3*)orig_points, *cam_pos, (float*)dc_ptr_adjusted, (float*)sh_ptr_adjusted, clamped);
+			// Handle clamping
+			clamped[3 * idx + 0] = (result.x < 0);
+			clamped[3 * idx + 1] = (result.y < 0);
+			clamped[3 * idx + 2] = (result.z < 0);
+			result = glm::max(result, 0.0f);
 		}
 		else
 		{
