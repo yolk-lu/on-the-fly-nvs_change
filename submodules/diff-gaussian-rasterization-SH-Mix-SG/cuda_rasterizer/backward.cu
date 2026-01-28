@@ -46,7 +46,14 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 
 	// Target location for this Gaussian to write SH gradients to
 	glm::vec3* dL_ddirect_color = dL_ddc + idx;
-	glm::vec3* dL_dsh = dL_dshs + idx * max_coeffs;
+	
+	// Fix stride for SG vs SH output pointer
+	glm::vec3* dL_dsh;
+	if (deg >= 0) {
+		dL_dsh = dL_dshs + idx * max_coeffs;
+	} else {
+		dL_dsh = (glm::vec3*)((float*)dL_dshs + idx * max_coeffs);
+	}
 
 	dEvalSHColor(dL_dRGB, dir, sh, deg, *dL_ddirect_color, dL_dsh, dRGBdx, dRGBdy, dRGBdz);
 
@@ -499,7 +506,7 @@ __global__ void preprocessCUDA(
 	// Compute gradient updates due to computing colors from SHs or SGs
 	if (shs)
 	{
-		if (D < 0)
+		if (D < 0 || M == 7)
 		{
 			// Local SH gradient buffer (48 floats)
 			float dL_dsh_local[48];
@@ -531,13 +538,15 @@ __global__ void preprocessCUDA(
 			glm::vec3 dRGBdz(0, 0, 0);
 
 			// Compute dL_dRGB same as computeColorFromSH (clamping)
-			glm::vec3 dL_dRGB = dL_dcolor[idx];
+			// dL_dcolor is float*, cast to vec3* to read RGB
+			glm::vec3 dL_dRGB = ((glm::vec3*)dL_dcolor)[idx];
 			dL_dRGB.x *= clamped[3 * idx + 0] ? 0 : 1;
 			dL_dRGB.y *= clamped[3 * idx + 1] ? 0 : 1;
 			dL_dRGB.z *= clamped[3 * idx + 2] ? 0 : 1;
 
 			// Compute direction
-			glm::vec3 pos = means[idx];
+			float3 m = means[idx];
+			glm::vec3 pos = {m.x, m.y, m.z};
 			glm::vec3 dir_orig = pos - *campos;
 			glm::vec3 dir = dir_orig / glm::length(dir_orig);
 
