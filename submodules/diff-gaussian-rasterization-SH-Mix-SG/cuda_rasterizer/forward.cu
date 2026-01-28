@@ -265,13 +265,24 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		// If D < 0, use SG
 		if (D < 0)
 		{
-			// Local storage for SH coeffs (Degree 3 = 16 floats * 3 channels = 48)
+			// Local storage for SH coeffs (Degree 3 = 16 coeffs * 3 channels = 48 floats)
 			float sh_stack[48]; 
 			computeSHFromSG(idx, M, shs, sh_stack);
-			// Pass local SHs to color computer. Degree is implicitly max (3) or derived from M? 
-			// computeColorFromSH takes `deg`. If D<0, we assume D=3 for the SH evaluation? 
-			// Or we pass |D|? Let's assume max degree 3 for now as evalSHBasis supports it.
-			result = computeColorFromSH(idx, 3, M, (glm::vec3*)orig_points, *cam_pos, dc, sh_stack, clamped);
+			
+			// Extract DC (Band 0) from the first 3 floats (Interleaved R, G, B)
+			glm::vec3 val_dc = {sh_stack[0], sh_stack[1], sh_stack[2]};
+			
+			// Adjust DC pointer because computeColorFromSH adds idx
+			glm::vec3* dc_ptr_local = &val_dc;
+			glm::vec3* dc_ptr_adjusted = dc_ptr_local - idx;
+
+			// Pass local SHs to color computer starting from Band 1 (offset 3 floats == 1 vec3)
+			// computeColorFromSH adds `idx * 16` (max_coeffs) to the pointer. We must subtract it to access local stack correctly.
+			glm::vec3* sh_ptr_local = (glm::vec3*)(sh_stack + 3);
+			glm::vec3* sh_ptr_adjusted = sh_ptr_local - idx * 16;
+			
+			// We pass deg=3. Max coeffs=16 (vec3s).
+			result = computeColorFromSH(idx, 3, 16, (glm::vec3*)orig_points, *cam_pos, (float*)dc_ptr_adjusted, (float*)sh_ptr_adjusted, clamped);
 		}
 		else
 		{

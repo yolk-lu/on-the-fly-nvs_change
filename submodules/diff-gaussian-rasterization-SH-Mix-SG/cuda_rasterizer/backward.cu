@@ -586,37 +586,45 @@ __global__ void preprocessCUDA(
 			for (int i=0; i<48; ++i) dL_dsh_local[i] = 0.f;
 
 			// 1. Backprop from Color to SH coeffs
-			// We pass a dummy SH pointer (shs) or our local sh buffer? 
-			// Wait, computeColorFromSH needs the FORWARD SH coeffs to compute gradients? 
-			// Yes: `float* sh = ((glm::vec3*)shs) + ...`
-			// But in SG mode, `shs` contains SG params, not SH coeffs.
-			// So we must RECOMPUTE forward SH coeffs here locally first!
+			// We must RECOMPUTE forward SH coeffs here locally first!
 			
 			float sh_forward_local[48];
 			computeSHFromSG(idx, M, shs, sh_forward_local);
 
+			// Extract DC (Band 0) from the first 3 floats (Interleaved R, G, B)
+			glm::vec3 val_dc = {sh_forward_local[0], sh_forward_local[1], sh_forward_local[2]};
+			glm::vec3* dc_ptr_local = &val_dc;
+			glm::vec3* dc_ptr_adjusted = dc_ptr_local - idx;
+
 			// Now call computeColorFromSH using LOCAL forward SHs and LOCAL gradient buffer
-			// Be careful: the function signature expects global pointers, but we pass local addresses.
-			// We cast local array to pointers. 
-			// Arguments: idx is irrelevant for local array access if we manage pointers correctly?
-			// `computeColorFromSH` adds `idx * max_coeffs` to the pointer.
-			// If we pass `sh_forward_local`, it will try to access `sh_forward_local + idx*...` -> SEGFAULT.
-			// We must modify `computeColorFromSH` to accept a flexible pointer OR adjust the pointer we pass.
-			// Hack: pass `sh_forward_local - idx * max_coeffs`. 
-			// Since `sh_forward_local` is local register/shared mem, this pointer arithmetic is valid virtual address.
-			// BUT `max_coeffs` in SH mode is 16 (for deg 3). `M` passed in might be SG size?
-			// `ext.cpp` passes `M = sh.size(1)` which is SG params count.
-			// We need to pass `max_coeffs=16` (number of vec3 SH coeffs) to computeColorFromSH.
+			// computeColorFromSH adds `idx * max_coeffs` to the pointer.
+			// We must subtract it to access local stack correctly.
 			
 			int max_coeffs_sh = 16;
-			glm::vec3* sh_ptr = (glm::vec3*)sh_forward_local - idx * max_coeffs_sh;
-			glm::vec3* dL_dsh_ptr = (glm::vec3*)dL_dsh_local - idx * max_coeffs_sh;
+			
+			// SH Pointer (Band 1 starts at offset 3 floats)
+			glm::vec3* sh_ptr_local = (glm::vec3*)(sh_forward_local + 3);
+			glm::vec3* sh_ptr_adjusted = sh_ptr_local - idx * max_coeffs_sh;
+			
+			// Gradient Pointer (Band 1 starts at offset 3 floats)
+			glm::vec3* dL_dsh_ptr_local = (glm::vec3*)(dL_dsh_local + 3);
+			glm::vec3* dL_dsh_ptr_adjusted = dL_dsh_ptr_local - idx * max_coeffs_sh;
+
+			// DC Gradient (Local variable)
+			glm::vec3 dL_ddc_val = {0.f, 0.f, 0.f};
+			glm::vec3* dL_ddc_ptr_local = &dL_ddc_val;
+			glm::vec3* dL_ddc_ptr_adjusted = dL_ddc_ptr_local - idx;
 
 			// Use Degree 3 hardcoded for SG mode
-			computeColorFromSH(idx, 3, max_coeffs_sh, (glm::vec3*)means, *campos, dc, (float*)sh_ptr, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_ddc, (glm::vec3*)dL_dsh_ptr);
+			computeColorFromSH(idx, 3, max_coeffs_sh, (glm::vec3*)means, *campos, (float*)dc_ptr_adjusted, (float*)sh_ptr_adjusted, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_ddc_ptr_adjusted, (glm::vec3*)dL_dsh_ptr_adjusted);
+
+			// Put DC gradient back into dL_dsh_local (Interleaved Band 0)
+			dL_dsh_local[0] = dL_ddc_val.x;
+			dL_dsh_local[1] = dL_ddc_val.y;
+			dL_dsh_local[2] = dL_ddc_val.z;
 
 			// 2. Backprop from SH coeffs to SG params
-			// dL_dsh_local now contains gradients w.r.t SH coefficients.
+			// dL_dsh_local now contains gradients w.r.t SH coefficients (Interleaved).
 			// We need to propagate this to dL_dsh (which points to global SG gradients).
 			computeSGIGrad(idx, M, shs, dL_dsh_local, dL_dsh);
 		}
