@@ -194,7 +194,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dcov3D = torch::zeros({P, 6}, means3D.options());
   torch::Tensor dL_ddc = torch::zeros({P, 1, 3}, means3D.options());
-  torch::Tensor dL_dsh = torch::zeros({P, M, 3}, means3D.options());
+  torch::Tensor dL_dsh;
+  if (degree < 0 || M == 7) {
+    dL_dsh = torch::zeros({P, M}, means3D.options());
+  } else {
+    dL_dsh = torch::zeros({P, M, 3}, means3D.options());
+  }
   torch::Tensor dL_dscales = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_drotations = torch::zeros({P, 4}, means3D.options()); // quats {P, 3, 3}
   torch::Tensor dL_dRs = torch::zeros({P, 3, 3}, means3D.options()); // quats {P, 3, 3}

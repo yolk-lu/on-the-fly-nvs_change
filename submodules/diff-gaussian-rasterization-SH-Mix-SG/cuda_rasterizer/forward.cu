@@ -31,7 +31,16 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 	dir = dir / glm::length(dir);
 
 	glm::vec3* direct_color = ((glm::vec3*)dc) + idx;
-	glm::vec3* sh = ((glm::vec3*)shs) + idx * max_coeffs;
+	
+	// Fix stride for SG vs SH
+	// SH (deg >= 0): Input is (P, M, 3), stride M vec3s (3M floats)
+	// SG (deg < 0): Input is (P, M), stride M floats
+	glm::vec3* sh;
+	if (deg >= 0) {
+		sh = ((glm::vec3*)shs) + idx * max_coeffs;
+	} else {
+		sh = (glm::vec3*)(shs + idx * max_coeffs);
+	}
 	
 	glm::vec3 result = evalSHColor(dir, direct_color[0], sh, deg);
 
@@ -161,6 +170,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	if (idx >= P)
 		return;
 
+	if (idx == 0) {
+		printf("preprocessCUDA: P=%d, D=%d, M=%d\n", P, D, M);
+	}
+
 	// Initialize radius and touched tiles to 0. If this isn't changed,
 	// this Gaussian will not be processed further.
 	radii[idx] = 0;
@@ -231,8 +244,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	{
 		glm::vec3 result;
 		// Abuse degree D to switch between SH and SG
-		// If D < 0, use SG
-		if (D < 0)
+		// If D < 0 or M == 7 (SG params), use SG
+		if (D < 0 || M == 7)
 		{
 			// Local storage for SH coeffs (Degree 3 = 16 coeffs * 3 channels = 48 floats)
 			float sh_stack[48]; 
