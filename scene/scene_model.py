@@ -247,46 +247,18 @@ class SceneModel:
         self.setup_scaling_activation()
         scaling_lower_bound_new = self.scaling_lower_bound
         
-        # Calculate Scene Center for Geometric LoD
-        scene_center = torch.zeros(3, device="cuda")
-        if self.approx_cam_centres is not None:
-             scene_center = self.approx_cam_centres.mean(dim=0).to("cuda")
-
         # Increase LoD for all anchors
         for anchor in self.anchors:
-            # GEOMETRIC DISTANCE SPLITTING
-            # 1. Get positions
-            xyz = anchor.gaussian_params["xyz"]["val"]
-            
-            # 2. Compute Distance to Center
-            dists = torch.norm(xyz - scene_center, dim=1)
-            
-            # 3. Define Threshold (Mean + 1 StdDev)
-            # This captures the "Core" of the scene. Outliers/Background are further away.
-            dist_threshold = dists.mean() + dists.std()
-            
-            # 4. Create Split Mask
-            # Close: Split (num_childs)
-            # Far: Keep (1)
-            num_childs_tensor = torch.ones(xyz.shape[0], dtype=torch.long, device=xyz.device)
-            split_mask = dists < dist_threshold
-            num_childs_tensor[split_mask] = self.increase_lod_num_childs
-            
-            # 5. Execute Split
-            anchor.increase_lod(num_childs_tensor, scaling_lower_bound_old, scaling_lower_bound_new)
+            # Uniform Splitting (FLoD Style): Split all Gaussians
+            # This ensures that higher LODs are strictly finer representations of the whole scene
+            # allowing for proper switching between Coarse (LOD1) and Fine (LOD N) models based on distance.
+            anchor.increase_lod(self.increase_lod_num_childs, scaling_lower_bound_old, scaling_lower_bound_new)
         
         # Update references if active anchor was modified
         self.gaussian_params = self.active_anchor.gaussian_params
         
         # Reset optimizer for new parameters
         self.reset_optimizer()
-        
-        # Reset other buffers if needed (e.g. max_radii2D)
-        # Usually train.py handles loop variables, but max_radii2D is often in SceneModel or external?
-        # SceneModel doesn't seem to store max_radii2D persistently as a class member in __init__, 
-        # but train.py might use it. 
-        # However, since we split Gaussians, the old max_radii2D is invalid size-wise (N changed).
-        # We should ensure the training loop knows to reset/resize its buffers.
 
 
     @property
@@ -579,6 +551,17 @@ class SceneModel:
         render_pkg["render"] = render_pkg["render"].clamp(0, 1).view(3, height, width)
         return render_pkg
 
+    def prepare_for_render(self, view_matrix):
+        """
+        Prepares the scene for rendering by blending anchors based on the view matrix.
+        Updates self.gaussian_params.
+        """
+        cam_centre = view_matrix.detach().inverse()[3, :3]
+        
+        # Load and blend anchors if in inference mode 
+        if self.inference_mode:
+            self.gaussian_params, self.anchor_weights = Anchor.blend(cam_centre, self.anchors, self.anchor_overlap)
+
     def render(
         self,
         width: int,
@@ -589,6 +572,7 @@ class SceneModel:
         top_view: bool = False,
         fov_x: float = None,
         fov_y: float = None,
+        override_params: dict = None,
     ):
         cam_centre = view_matrix.detach().inverse()[3, :3]
 
@@ -623,20 +607,34 @@ class SceneModel:
         )
         rasterizer = GaussianRasterizer(raster_settings)
         with self.lock:
-            # Load and blend anchors if in inference mode 
-            if self.inference_mode and not top_view:
-                self.gaussian_params, self.anchor_weights = Anchor.blend(cam_centre, self.anchors, self.anchor_overlap)
+            # Prepare scene (Anchor blending) if overrides are not provided
+            # If overrides are provided, we assume the caller handled selection/blending
+            if override_params is None and not top_view:
+                self.prepare_for_render(view_matrix)
             
-            screenspace_points = torch.zeros_like(self.xyz, requires_grad=True)
-            if self.xyz.shape[0] > 0:
+            # Use overrides if provided, otherwise use class members
+            if override_params is not None:
+                xyz = override_params.get("xyz", self.xyz)
+                scaling = override_params.get("scaling", self.scaling)
+                opacity = override_params.get("opacity", self.opacity)
+                rotation = override_params.get("rotation", self.rotation)
+                features_dc = override_params.get("features_dc", self.features_dc)
+                features_rest = override_params.get("features_rest", self.features_rest)
+            else:
+                xyz = self.xyz
+                scaling = self.scaling
+                opacity = self.opacity
+                rotation = self.rotation
+                features_dc = self.features_dc
+                features_rest = self.features_rest
+
+            screenspace_points = torch.zeros_like(xyz, requires_grad=True)
+            if xyz.shape[0] > 0:
                 # Set constant scaling and opacity to visualize the Gaussians' positions in the top view
                 if top_view:
-                    scaling = torch.ones_like(self.scaling) * scaling_modifier
-                    opacity = torch.ones_like(self.opacity)
-                else:
-                    scaling = self.scaling
-                    opacity = self.opacity
-                    
+                    scaling = torch.ones_like(scaling) * scaling_modifier
+                    opacity = torch.ones_like(opacity)
+                else: 
                     # --- Perceptual LoD Modulation (Opacity Soft-Thresholding) ---
                     if hasattr(self, 'perceptual_lod_config') and self.perceptual_lod_config:
                         # Unpack config
@@ -646,12 +644,8 @@ class SceneModel:
                         tau_max = self.perceptual_lod_config.get('tau_max', 3.0)
                         
                         # 1. Compute Depth and Eccentricity
-                        # view_matrix is World-to-Camera (Check transpose convention!)
-                        # In this repo, view_matrix seems to be used directly in rasterizer.
-                        # Usually rasterizer expects Row-Major (Points @ Matrix).
-                        # Let's assume standard P_view = xyz_h @ view_matrix
                         
-                        xyz = self.xyz
+                        # Use local xyz
                         ones = torch.ones((xyz.shape[0], 1), device=xyz.device)
                         xyz_h = torch.cat([xyz, ones], dim=1)
                         
@@ -661,7 +655,6 @@ class SceneModel:
                         depth = torch.clamp(depth, min=0.01) # Avoid div by zero
                         
                         # Project to Screen (NDC)
-                        # projection_matrix is (4, 4)
                         P_clip = xyz_h @ projection_matrix # (N, 4)
                         w_clip = P_clip[:, 3]
                         inv_w = 1.0 / (w_clip + 1e-7)
@@ -669,23 +662,17 @@ class SceneModel:
                         y_ndc = P_clip[:, 1] * inv_w
                         
                         # Eccentricity (Distance from center in NDC)
-                        # Center is (0, 0)
                         e = torch.sqrt(x_ndc**2 + y_ndc**2)
                         
                         # Weight Factors
                         W_ecc = 1.0 / (1.0 + k_ecc * e)
-                        # W_vel = 1.0 # Assume static for now
-                        W_percept = W_ecc # * W_vel
+                        W_percept = W_ecc 
                         
-                        # Effective Radius (Eq 4.1 & 4.2)
-                        # r = (s * f) / d
+                        # Effective Radius
                         # Get max scale
                         s = torch.max(scaling, dim=1).values
                         
                         # Focal length f (pixels)
-                        # tanfovx = math.tan(fov_x * 0.5) -> fov_x is in radians?
-                        # The args passed 'tanfovx' to rasterizer settings.
-                        # f = W / (2 * tanfovx)
                         f_x = width / (2.0 * tanfovx)
                         f_y = height / (2.0 * tanfovy)
                         f = (f_x + f_y) * 0.5
@@ -693,22 +680,20 @@ class SceneModel:
                         r = (s * f) / depth
                         r_hat = r * W_percept
                         
-                        # Soft Thresholding (Eq 4.6)
-                        # smoothstep(min, max, x)
+                        # Soft Thresholding
                         t = torch.clamp((r_hat - tau_min) / (tau_max - tau_min), 0.0, 1.0)
                         modulation = t * t * (3.0 - 2.0 * t)
                         
                         opacity = opacity * modulation.unsqueeze(-1)
-                    # -----------------------------------------------------------
 
                 color, invdepth, mainGaussID, radii = rasterizer(
-                    self.xyz,
+                    xyz,
                     screenspace_points,
                     opacity,
-                    self.f_dc,
-                    self.f_rest,
+                    features_dc,
+                    features_rest,
                     scaling,
-                    self.rotation,
+                    rotation,
                     view_matrix,
                 )
             else:
