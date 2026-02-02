@@ -618,15 +618,15 @@ class SceneModel:
                 scaling = override_params.get("scaling", self.scaling)
                 opacity = override_params.get("opacity", self.opacity)
                 rotation = override_params.get("rotation", self.rotation)
-                features_dc = override_params.get("features_dc", self.features_dc)
-                features_rest = override_params.get("features_rest", self.features_rest)
+                features_dc = override_params.get("features_dc", self.f_dc)
+                features_rest = override_params.get("features_rest", self.f_rest)
             else:
                 xyz = self.xyz
                 scaling = self.scaling
                 opacity = self.opacity
                 rotation = self.rotation
-                features_dc = self.features_dc
-                features_rest = self.features_rest
+                features_dc = self.f_dc
+                features_rest = self.f_rest
 
             screenspace_points = torch.zeros_like(xyz, requires_grad=True)
             if xyz.shape[0] > 0:
