@@ -17,6 +17,7 @@ from plyfile import PlyData, PlyElement
 
 from scene.keyframe import Keyframe
 from utils import inverse_sigmoid, to_numpy
+from scene.sg_utils import compute_sh_from_sg
 
 
 class Anchor:
@@ -185,34 +186,55 @@ class Anchor:
         features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
         features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
 
-        extra_f_names = [
-            p.name
-            for p in plydata.elements[0].properties
-            if p.name.startswith("f_rest_")
-        ]
-        extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
+        # Check for SG params
+        sg_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("sg_")]
+        sg_names = sorted(sg_names, key=lambda x: int(x.split("_")[-1]))
+        is_sg = len(sg_names) > 0
         
-        # Check for SG mode (7 features) vs SH mode
-        is_sg = len(extra_f_names) == 7
-        if not is_sg:
-            assert len(extra_f_names) == 3 * (max_sh_degree + 1) ** 2 - 3
+        gaussian_params = {
+            "xyz": {"val": torch.tensor(xyz, dtype=torch.float)},
+            "f_dc": {"val": torch.tensor(features_dc, dtype=torch.float).transpose(1, 2).contiguous()},
+            "scaling": {}, # Filled later
+            "rotation": {}, # Filled later
+            "opacity": {"val": torch.tensor(opacities, dtype=torch.float)},
+        }
 
-        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
-        for idx, attr_name in enumerate(extra_f_names):
-            features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-            
         if is_sg:
-            # SG mode: (N, 7) directly, no transpose needed usually or handled in init
-            # Tensor expects (N, 7) based on SceneModel init
-            f_rest_tensor = torch.tensor(features_extra, dtype=torch.float)
+            # Load SG params
+            # Expect N channels (e.g. 7 for 1 lobe)
+            sg_data = np.zeros((xyz.shape[0], len(sg_names)))
+            for idx, attr_name in enumerate(sg_names):
+                sg_data[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            
+            # Reshape to (N, 1, 7) assuming 1 lobe for now. 
+            # If we had multiple lobes, we'd need to know the structure or infer from count.
+            # Current implementation uses (N, 1, 7).
+            sg_tensor = torch.tensor(sg_data, dtype=torch.float).unsqueeze(1)
+            gaussian_params["sg_params"] = {"val": sg_tensor}
+            
+            # We can also load f_rest if present, but it's redundant/derived. 
+            # We'll skip loading f_rest into gaussian_params to rely on on-the-fly generation.
         else:
+            # Load SH params (Legacy)
+            extra_f_names = [
+                p.name
+                for p in plydata.elements[0].properties
+                if p.name.startswith("f_rest_")
+            ]
+            extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
+            # assert len(extra_f_names) == 3 * (max_sh_degree + 1) ** 2 - 3
+            
+            features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
+            for idx, attr_name in enumerate(extra_f_names):
+                features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
             # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
             features_extra = features_extra.reshape(
                 (features_extra.shape[0], 3, (max_sh_degree + 1) ** 2 - 1)
             )
             f_rest_tensor = torch.tensor(features_extra, dtype=torch.float).transpose(1, 2).contiguous()
+            gaussian_params["f_rest"] = {"val": f_rest_tensor}
 
-        # ... (rest of loading) ...
         
         scale_names = [
             p.name
@@ -223,6 +245,7 @@ class Anchor:
         scales = np.zeros((xyz.shape[0], len(scale_names)))
         for idx, attr_name in enumerate(scale_names):
             scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        gaussian_params["scaling"]["val"] = torch.tensor(scales, dtype=torch.float)
 
         rot_names = [
             p.name for p in plydata.elements[0].properties if p.name.startswith("rot")
@@ -231,15 +254,7 @@ class Anchor:
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
-
-        gaussian_params = {
-            "xyz": {"val": torch.tensor(xyz, dtype=torch.float)},
-            "f_dc": {"val": torch.tensor(features_dc, dtype=torch.float).transpose(1, 2).contiguous()},
-            "f_rest": {"val": f_rest_tensor},
-            "scaling": {"val": torch.tensor(scales, dtype=torch.float)},
-            "rotation": {"val": torch.tensor(rots, dtype=torch.float)},
-            "opacity": {"val": torch.tensor(opacities, dtype=torch.float)},
-        }
+        gaussian_params["rotation"]["val"] = torch.tensor(rots, dtype=torch.float)
 
         return cls(gaussian_params, position.cuda(), [])
 
@@ -249,26 +264,21 @@ class Anchor:
         for i in range(self.gaussian_params["f_dc"]["val"].shape[2]):
             l.append("f_dc_{}".format(i))
         
-        #---------------------------------------------------------------------------
-        # TODO: fix for SG dimensions
-
-        f_rest_val = self.gaussian_params["f_rest"]["val"]
-        if f_rest_val.dim() == 2:
-            # SG 模式: (N, 7)，特徵數就是第 1 維的大小
-            num_rest_features = f_rest_val.shape[1]
-        else:
-            # SH 模式: (N, 15, 3)，特徵數是 15 * 3
-            num_rest_features = f_rest_val.shape[1] * f_rest_val.shape[2]
-            
-        for i in range(num_rest_features):
+        # Viewer Compatibility: Always save f_rest (Standard SH)
+        # 15 coeffs * 3 channels = 45 attributes
+        # Standard 3DGS stores them as f_rest_0 ... f_rest_44
+        num_sh_rest = 45 # Degree 3
+        for i in range(num_sh_rest):
             l.append("f_rest_{}".format(i))
+            
+        # If SG Params exist, save them as custom attributes for training resumption
+        if "sg_params" in self.gaussian_params:
+            sg_val = self.gaussian_params["sg_params"]["val"]
+            # Flatten: (N, 1, 7) -> (N, 7) -> 7 attributes
+            num_sg = sg_val.shape[1] * sg_val.shape[2]
+            for i in range(num_sg):
+                l.append("sg_{}".format(i))
         
-        #--------------------------------------------------------------------------
-        # for i in range(
-        #     self.gaussian_params["f_rest"]["val"].shape[1]
-        #     * self.gaussian_params["f_rest"]["val"].shape[2]
-        # ):
-        #     l.append("f_rest_{}".format(i))
         l.append("opacity")
         for i in range(self.gaussian_params["scaling"]["val"].shape[1]):
             l.append("scale_{}".format(i))
@@ -287,30 +297,46 @@ class Anchor:
             .transpose(1, 2)
             .flatten(start_dim=1)
         )
-        # TODO: fix for SG dimensions
-
-        f_rest_tensor = self.gaussian_params["f_rest"]["val"].detach()
         
-        if f_rest_tensor.dim() == 3:
-            # 舊的 SH 模式: (N, 15, 3) -> 需要 transpose(1, 2)
+        # Prepare f_rest (SH) and sg_data (SG)
+        f_rest = None
+        sg_data = None
+        
+        if "sg_params" in self.gaussian_params:
+            # SG Mode: Convert to SH for viewer compatibility
+            sg_val = self.gaussian_params["sg_params"]["val"].detach() # (N, 1, 7)
+            
+            amplitude = torch.exp(sg_val[..., 0:3])
+            axis = sg_val[..., 3:6]
+            sharpness = torch.exp(sg_val[..., 6:7])
+            
+            # Compute SH (Degree 3)
+            _, f_rest_tensor = compute_sh_from_sg(amplitude, axis, sharpness, degree=3)
+            # f_rest_tensor: (N, 15, 3)
+            
             f_rest = to_numpy(
                 f_rest_tensor
+                .transpose(1, 2) # (N, 3, 15)
+                .flatten(start_dim=1) # (N, 45)
+            )
+            
+            # Save SG Params as extra attributes
+            sg_data = to_numpy(
+                sg_val
+                .flatten(start_dim=1) # (N, 7)
+            )
+            
+        elif "f_rest" in self.gaussian_params:
+            # Standard SH Mode
+            f_rest = to_numpy(
+                self.gaussian_params["f_rest"]["val"]
+                .detach()
                 .transpose(1, 2)
                 .flatten(start_dim=1)
             )
         else:
-            # 新的 SG 模式: (N, 7) -> 直接轉 Numpy，不需要 transpose
-            f_rest = to_numpy(f_rest_tensor)
-
-
-
-        # f_rest = to_numpy(
-        #     self.gaussian_params["f_rest"]["val"]
-        #     .detach()
-        #     .transpose(1, 2)
-        #     .flatten(start_dim=1)
-        # )
-
+            # Fallback (Deg 0?)
+            f_rest = np.zeros((xyz.shape[0], 45))
 
         opacities = to_numpy(self.gaussian_params["opacity"]["val"])
         scale = to_numpy(self.gaussian_params["scaling"]["val"])
@@ -321,9 +347,16 @@ class Anchor:
         ]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate(
-            (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
-        )
+        
+        # Concatenate: [xyz, normals, f_dc, f_rest, (optional sg), opacities, scale, rot]
+        # Order must match construct_list_of_attributes
+        
+        cat_list = [xyz, normals, f_dc, f_rest]
+        if sg_data is not None:
+            cat_list.append(sg_data)
+        cat_list.extend([opacities, scale, rotation])
+        
+        attributes = np.concatenate(cat_list, axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)

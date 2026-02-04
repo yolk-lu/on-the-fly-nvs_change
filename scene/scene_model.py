@@ -49,6 +49,8 @@ from poses.guided_mvs import GuidedMVS
 from scene.optimizers import SparseGaussianAdam
 from scene.keyframe import Keyframe
 from scene.anchor import Anchor
+from scene.sg_utils import compute_sh_from_sg
+from scene.sg_utils import compute_sh_from_sg
 from utils import (
     RGB2SH,
     depth2points,
@@ -162,10 +164,10 @@ class SceneModel:
                 # },
                 #
                 #
-                "f_rest": {
-                    # 2 bands * 3 channels = 6 floats.
-                    # Mapped as: [Axis(3), Sharpness(1)+Pad(2)]
-                    "val": torch.empty(0, 2, 3, device="cuda"),
+                "sg_params": {
+                    # SG Parameters: [Amplitude(3), Axis(3), Sharpness(1)]
+                    # Shape: (N, 1, 7) for 1 lobe
+                    "val": torch.empty(0, 1, 7, device="cuda"),
                     "lr": args.feature_lr
                 },
 
@@ -615,20 +617,47 @@ class SceneModel:
                 self.prepare_for_render(view_matrix)
             
             # Use overrides if provided, otherwise use class members
-            if override_params is not None:
+            if override_params:
                 xyz = override_params.get("xyz", self.xyz)
                 scaling = override_params.get("scaling", self.scaling)
                 opacity = override_params.get("opacity", self.opacity)
                 rotation = override_params.get("rotation", self.rotation)
                 features_dc = override_params.get("features_dc", self.f_dc)
-                features_rest = override_params.get("features_rest", self.f_rest)
+                features_rest = override_params.get("features_rest", self.gaussian_params.get("f_rest", {}).get("val", None))
+                sg_params = override_params.get("sg_params", self.gaussian_params.get("sg_params", {}).get("val", None))
             else:
                 xyz = self.xyz
                 scaling = self.scaling
-                opacity = self.opacity
                 rotation = self.rotation
+                opacity = self.opacity
                 features_dc = self.f_dc
-                features_rest = self.f_rest
+                features_rest = self.gaussian_params.get("f_rest", {}).get("val", None)
+                sg_params = self.gaussian_params.get("sg_params", {}).get("val", None)
+
+            # SG Optimization: Pass params directly to rasterizer (CUDA will project)
+            sh_degree_to_use = self.active_sh_degree
+            if sg_params is not None:
+                # sg_params: (N, Lobes, 7)
+                # Reshape to (N, 7) for rasterizer if 1 lobe
+                # If multiple lobes, might need logic, but current init is 1 lobe.
+                # Squeeze the middle dim if it serves as 'lobes'. 
+                # Our init in add_new_gaussians: (N, 1, 7).
+                
+                # Check dim
+                if sg_params.dim() == 3 and sg_params.shape[1] == 1:
+                     features_rest = sg_params.squeeze(1) # (N, 7)
+                else:
+                     # Fallback or just flatten? 
+                     # If (N, M, 7) -> (N, M*7)? 
+                     # Rasterizer expects (N, M). If M=7, it detects SG.
+                     features_rest = sg_params.reshape(sg_params.shape[0], -1)
+
+                # Force degree -1 just to be safe (though M=7 check exists)
+                sh_degree_to_use = -1
+                
+            elif features_rest is None:
+                # Fallback if neither SG nor f_rest exists
+                features_rest = torch.zeros((xyz.shape[0], 15, 3), device="cuda")
 
             screenspace_points = torch.zeros_like(xyz, requires_grad=True)
             if xyz.shape[0] > 0:
@@ -697,6 +726,7 @@ class SceneModel:
                     scaling,
                     rotation,
                     view_matrix,
+                    sh_degree=sh_degree_to_use,
                 )
             else:
                 # If no Gaussians are present, return empty tensors
@@ -786,14 +816,18 @@ class SceneModel:
             return self.gt_Rts
 
     def make_dummy_ext_tensor(self):
-        return {
+        ext = {
             "xyz": self.xyz[:0].detach(),
             "f_dc": self.f_dc[:0].detach(),
-            "f_rest": self.f_rest[:0].detach(),
             "opacity": self.opacity[:0].detach(),
             "scaling": self.scaling[:0].detach(),
             "rotation": self.rotation[:0].detach(),
         }
+        if "f_rest" in self.gaussian_params:
+            ext["f_rest"] = self.gaussian_params["f_rest"]["val"][:0].detach()
+        if "sg_params" in self.gaussian_params:
+            ext["sg_params"] = self.gaussian_params["sg_params"]["val"][:0].detach()
+        return ext
 
     def reset(self, keyframe_id: int = -1):
         """Remove the Gaussians that are visible in the given keyframe."""
@@ -881,6 +915,8 @@ class SceneModel:
                 )
             render_pkg = self.render_from_id(keyframe_id)
             rendered_depth = 1 / render_pkg["invdepth"][0].clamp_min(1e-8)
+        else:
+            valid_gs_mask = torch.zeros(0, dtype=torch.bool, device="cuda")
 
         # Check for occlusions
         if rendered_depth is not None:
@@ -940,44 +976,38 @@ class SceneModel:
         opacities = inverse_sigmoid(opacities)
 
         ## Initialize SH, rotations as identity
+        rots = torch.zeros((new_pts.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
 
 #------------------------------------------------------------------------------------------------------------------
-        # TODO: 修改f_rest的初始值, 因為現在使用SG取代, 所以不能設定成0
-
-        # Original
-        # f_rest = torch.zeros(
-        #     f_dc.shape[0],
-        #     (self.max_sh_degree + 1) * (self.max_sh_degree + 1) - 1,
-        #     3,
-        #     device="cuda",
-        # )
-
-
-        # Change
- 
-        # Axis
-        # 相機的中心視角
+        # SG Initialization
+        
+        # 1. Axis: From point to camera
         cam_center = keyframe.approx_centre
-        
-        # 計算點到相機的方向向量
         dir_to_cam = cam_center[None, :] - new_pts
-        init_axis = F.normalize(dir_to_cam, dim=-1)  # 單位向量
+        init_axis = F.normalize(dir_to_cam, dim=-1)  # (N, 3)
 
-        # Sharpness
+        # 2. Sharpness: Start reasonably sharp
+        # log-space: likely need positive. param is passed to exp() in render.
+        # init as 2.0 -> exp(2.0) ~ 7.39
         init_sharpness = torch.ones(new_pts.shape[0], 1, device="cuda") * 2.0
+
+        # 3. Amplitude: Start small
+        # init as -2.0 -> exp(-2.0) ~ 0.135
+        init_amplitude = torch.ones(new_pts.shape[0], 3, device="cuda") * -2.0
         
-        # Pack into (N, 2, 3) tensor
-        # Band 0: Axis (3 floats)
-        # Band 1: Sharpness (1 float) + Padding (2 floats)
+        # Pack: (N, 1, 7) - 1 Lobe
+        # [Amp(3), Axis(3), Sharpness(1)]
+        sg_lobe = torch.cat([init_amplitude, init_axis, init_sharpness], dim=1).unsqueeze(1)
         
-        # Band 0 = Axis
-        band0 = init_axis.unsqueeze(1) # (N, 1, 3)
+        # ...
         
-        # Band 1 = Sharpness + Pad
-        padding = torch.zeros(new_pts.shape[0], 2, device="cuda")
-        band1 = torch.cat([init_sharpness, padding], dim=1).unsqueeze(1) # (N, 1, 3)
+        # It seems I am replacing the PREPARATION of tensors.
+        # But the actual add_and_prune call for ADDING is likely further down.
+        # I need to find the add_and_prune call that uses new_pts, f_dc etc.
         
-        f_rest = torch.cat([band0, band1], dim=1) # (N, 2, 3)
+        # If I look at the end of the file...
 
 #------------------------------------------------------------------------------------------------------------------
 
@@ -999,16 +1029,26 @@ class SceneModel:
             valid_gs_mask = torch.ones(0, device="cuda", dtype=torch.bool)
 
         ## Append the new Gaussians
+        # Prepare extension tensors
         extension_tensors = {
             "xyz": new_pts,
             "f_dc": f_dc,
-            "f_rest": f_rest,
             "opacity": opacities,
             "scaling": scales,
             "rotation": rots,
         }
+        
+        # Add SG params if they exist
+        if self.gaussian_params.get("sg_params") is not None:
+             extension_tensors["sg_params"] = sg_lobe
+
+        # Add f_rest if it exists (Legacy SH mode)
+        if self.gaussian_params.get("f_rest") is not None:
+             f_rest = torch.zeros(f_dc.shape[0], 15, 3, device="cuda")
+             extension_tensors["f_rest"] = f_rest
+        
         with self.lock:
-            self.optimizer.add_and_prune(extension_tensors, valid_gs_mask)
+             self.optimizer.add_and_prune(extension_tensors, valid_gs_mask)
 
     def init_intrinsics(self):
         self.FoVx = focal2fov(self.f, self.width)

@@ -181,27 +181,12 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, dc, shs, scales, rotations, viewmatrix):
+    def forward(self, means3D, means2D, opacities, dc, shs, scales, rotations, viewmatrix, sh_degree=None):
         
         raster_settings = self.raster_settings
-
-        # if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
-        #     raise Exception('Please provide excatly one of either SHs or precomputed colors!')
         
-        # if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
-        #     raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
-        
-        # if shs is None:
-        #     shs = torch.Tensor([])
-        # if colors_precomp is None:
-        #     colors_precomp = torch.Tensor([])
-
-        # if scales is None:
-        #     scales = torch.Tensor([])
-        # if rotations is None:
-        #     rotations = torch.Tensor([])
-        # if cov3D_precomp is None:
-        #     cov3D_precomp = torch.Tensor([])
+        if sh_degree is not None:
+            raster_settings = raster_settings._replace(sh_degree=sh_degree)
 
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(
