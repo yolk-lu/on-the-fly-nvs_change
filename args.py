@@ -118,6 +118,22 @@ def get_args():
                         help="Ratio for scaling reduction between LoDs")
     parser.add_argument('--increase_lod_num_childs', type=int, default=2, 
                         help="Number of children to spawn when increasing LoD")
+    parser.add_argument('--lod_min_sample_ratio', type=float, default=0.4,
+                        help="At the coarsest LoD, keep this ratio of edge-based Gaussian spawn probability")
+    parser.add_argument('--lod_merge_voxel_factor', type=float, default=4.0,
+                        help="Controls voxel size for LoD primitive merging at low levels (higher => fewer, blurrier Gaussians)")
+    parser.add_argument('--lod_merge_min_points', type=int, default=256,
+                        help="Minimum number of newly spawned Gaussians before applying LoD merge")
+    parser.add_argument('--lod_blur_scale_boost', type=float, default=0.25,
+                        help="Additional scale boost applied after merging at low LoD to increase blur")
+    parser.add_argument('--lod_min_pose_stability', type=float, default=0.55,
+                        help="Minimum pose stability score required before increasing LoD")
+    parser.add_argument('--lod_max_projection_error_px', type=float, default=3.0,
+                        help="Maximum mean projection footprint error (in px) allowed before increasing LoD")
+    parser.add_argument('--lod_pose_window', type=int, default=8,
+                        help="Number of recent keyframes used for pose stability estimation")
+    parser.add_argument('--lod_progressive_max_extra_epochs', type=int, default=3,
+                        help="Maximum extra fine-tuning epochs per LoD level when the progression gate is not satisfied")
 
 
     ## Keyframe management

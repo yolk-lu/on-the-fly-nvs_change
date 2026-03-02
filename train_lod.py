@@ -28,6 +28,7 @@ from poses.pose_initializer import PoseInitializer
 from poses.triangulator import Triangulator
 from scene.dense_extractor import DenseExtractor
 from scene.keyframe import Keyframe
+from scene.LoD_utils import lod_progressive_ready
 from scene.mono_depth import MonoDepthEstimator
 from scene.scene_model import SceneModel
 from gaussianviewer import GaussianViewer
@@ -412,6 +413,42 @@ if __name__ == "__main__":
                     scene_model.inference_mode = False
                     torch.cuda.empty_cache()
 
+        lod_gate = lod_progressive_ready(
+            scene_model,
+            min_pose_stability=args.lod_min_pose_stability,
+            max_projection_error_px=args.lod_max_projection_error_px,
+            pose_window=args.lod_pose_window,
+        )
+        print(
+            f"[LoD Gate] L{current_lod_step}: ready={lod_gate['ready']} "
+            f"pose={lod_gate['pose_stability']:.3f}, proj_mean={lod_gate['projection_error_mean']:.3f}px"
+        )
+
+        extra_epochs = 0
+        while (
+            current_lod_step < args.lod_max
+            and not lod_gate["ready"]
+            and extra_epochs < args.lod_progressive_max_extra_epochs
+        ):
+            extra_epochs += 1
+            scene_model.inference_mode = False
+            epoch_start_time = time.time()
+            with tracker.track(f"LoD_{current_lod_step}_extra"):
+                scene_model.finetune_epoch()
+            reconstruction_time += time.time() - epoch_start_time
+
+            lod_gate = lod_progressive_ready(
+                scene_model,
+                min_pose_stability=args.lod_min_pose_stability,
+                max_projection_error_px=args.lod_max_projection_error_px,
+                pose_window=args.lod_pose_window,
+            )
+            print(
+                f"[LoD Gate][extra {extra_epochs}/{args.lod_progressive_max_extra_epochs}] "
+                f"ready={lod_gate['ready']} pose={lod_gate['pose_stability']:.3f}, "
+                f"proj_mean={lod_gate['projection_error_mean']:.3f}px"
+            )
+
         # Save checkpoint at the end of each LoD level to a dedicated folder
         # This supports the request: "different level have different ply" and folders
         save_dir = os.path.join(args.model_path, f"lod_{current_lod_step}")
@@ -423,6 +460,11 @@ if __name__ == "__main__":
 
         # Increase LoD if not at max
         if current_lod_step < args.lod_max:
+            if not lod_gate["ready"]:
+                print(
+                    f"[LoD Gate] Max extra epochs reached at LoD {current_lod_step} "
+                    f"(reason={lod_gate['reason']}). Progressing to next LoD."
+                )
             print(f"Increasing LoD from {current_lod_step} to {current_lod_step + 1}")
             with tracker.track(f"IncLoD_{current_lod_step}"):
                 scene_model.increase_lod()

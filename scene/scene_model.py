@@ -108,6 +108,10 @@ class SceneModel:
         self.lod1_scaling_lower_bound = getattr(args, 'lod1_scaling_lower_bound', 0.001)
         self.lod_scaling_ratio = getattr(args, 'lod_scaling_ratio', 2.0)
         self.increase_lod_num_childs = getattr(args, 'increase_lod_num_childs', 2)
+        self.lod_min_sample_ratio = getattr(args, 'lod_min_sample_ratio', 0.4)
+        self.lod_merge_voxel_factor = getattr(args, 'lod_merge_voxel_factor', 4.0)
+        self.lod_merge_min_points = getattr(args, 'lod_merge_min_points', 256)
+        self.lod_blur_scale_boost = getattr(args, 'lod_blur_scale_boost', 0.25)
         self.current_lod = self.lod_min
         self.setup_scaling_activation()
 
@@ -259,6 +263,66 @@ class SceneModel:
         
         # Reset optimizer for new parameters
         self.reset_optimizer()
+
+    def _lod_progress(self):
+        if self.lod_max <= self.lod_min:
+            return 1.0
+        return float(self.current_lod - self.lod_min) / float(self.lod_max - self.lod_min)
+
+    @torch.no_grad()
+    def _coarsen_extension_tensors_for_lod(self, extension_tensors: dict[str, torch.Tensor]):
+        n_pts = extension_tensors["xyz"].shape[0]
+        if n_pts < self.lod_merge_min_points:
+            return extension_tensors
+
+        lod_progress = self._lod_progress()
+        merge_strength = 1.0 - lod_progress
+        if merge_strength <= 1e-6:
+            return extension_tensors
+
+        xyz = extension_tensors["xyz"]
+        device = xyz.device
+
+        linear_scales = torch.exp(extension_tensors["scaling"]) + self.scaling_lower_bound
+        base_radius = linear_scales.mean(dim=-1).median().clamp(min=1e-6)
+        voxel_size = base_radius * (1.0 + self.lod_merge_voxel_factor * merge_strength)
+
+        vox = torch.floor(xyz / voxel_size).to(torch.int64)
+        _, inverse, counts = torch.unique(vox, dim=0, return_inverse=True, return_counts=True)
+        m = counts.shape[0]
+        if m >= n_pts:
+            return extension_tensors
+
+        alpha = torch.sigmoid(extension_tensors["opacity"]).squeeze(-1).clamp(1e-5, 1 - 1e-5)
+        importance = alpha * linear_scales.max(dim=-1).values.square()
+        importance = importance.clamp(min=1e-8)
+
+        wsum = torch.zeros(m, device=device, dtype=importance.dtype)
+        wsum.index_add_(0, inverse, importance)
+        norm = importance / wsum[inverse]
+
+        merged = {}
+        for key, tensor in extension_tensors.items():
+            if key == "opacity":
+                continue
+            flat = tensor.reshape(n_pts, -1)
+            out = torch.zeros(m, flat.shape[1], device=device, dtype=flat.dtype)
+            out.index_add_(0, inverse, flat * norm[:, None])
+            merged[key] = out.reshape(m, *tensor.shape[1:])
+
+        log_trans = torch.log((1.0 - alpha).clamp(min=1e-8))
+        sum_log_trans = torch.zeros(m, device=device, dtype=log_trans.dtype)
+        sum_log_trans.index_add_(0, inverse, log_trans)
+        merged_alpha = (1.0 - torch.exp(sum_log_trans)).clamp(1e-4, 1 - 1e-4)
+        merged["opacity"] = inverse_sigmoid(merged_alpha[:, None])
+
+        merged_counts = counts.to(linear_scales.dtype).pow(1.0 / 3.0)
+        blur_gain = 1.0 + self.lod_blur_scale_boost * merge_strength
+        merged_linear_scale = torch.exp(merged["scaling"]) + self.scaling_lower_bound
+        merged_linear_scale = merged_linear_scale * merged_counts[:, None] * blur_gain
+        merged["scaling"] = torch.log((merged_linear_scale - self.scaling_lower_bound).clamp(min=1e-6))
+
+        return merged
 
 
     @property
@@ -421,6 +485,16 @@ class SceneModel:
         i = 0
         while i < n_iters or (run_until_interupt and not self.interupt_optimization): 
             self.optimization_step()
+
+            if i % 500 == 0:
+                 active_idx = len(self.anchors) - 1
+                 # Check points count safely
+                 n_pts = 0
+                 if hasattr(self, 'active_anchor') and 'xyz' in self.active_anchor.gaussian_params:
+                      n_pts = self.active_anchor.gaussian_params['xyz']['val'].shape[0]
+                 
+                 print(f"[Opt] Iter {i}/{n_iters}. Active Anchor {active_idx} (Points: {n_pts}). Frames: {len(self.active_frames_gpu)}")
+
             i += 1
         
     def join_optimization_thread(self):
@@ -842,7 +916,8 @@ class SceneModel:
         ## Define which pixels should become Gaussians
         init_proba *= self.init_proba_scaler
         penalty *= self.init_proba_scaler
-        sample_mask = torch.rand_like(init_proba) < init_proba - penalty # eq. 3
+        lod_sample_ratio = self.lod_min_sample_ratio + (1.0 - self.lod_min_sample_ratio) * self._lod_progress()
+        sample_mask = torch.rand_like(init_proba) < (init_proba - penalty) * lod_sample_ratio # eq. 3 + LoD factor
 
         sampled_uv = self.uv[sample_mask]
         ## Initialize positions
@@ -998,6 +1073,7 @@ class SceneModel:
             "scaling": scales,
             "rotation": rots,
         }
+        extension_tensors = self._coarsen_extension_tensors_for_lod(extension_tensors)
         with self.lock:
             self.optimizer.add_and_prune(extension_tensors, valid_gs_mask)
 
@@ -1150,12 +1226,20 @@ class SceneModel:
                     merged_gaussians = {
                         "xyz": (self.gaussian_params["xyz"]['val'][selected_nn_idx, :] * weights).sum(dim=1),
                         "f_dc": (self.gaussian_params["f_dc"]['val'][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1),
-                        "f_rest": (self.gaussian_params["f_rest"]["val"][selected_nn_idx, :] * weights).sum(dim=1),
-                        # "f_rest": (self.gaussian_params["f_rest"]['val'][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1),
                         "opacity": inverse_sigmoid(self.gaussian_params["opacity"]['val'][selected_nn_idx, :].sigmoid() * weights).sum(dim=1),
                         "scaling": torch.log((torch.exp(self.gaussian_params["scaling"]['val'][selected_nn_idx, :]) * weights * (k+1)).sum(dim=1)),
                         "rotation": (self.gaussian_params["rotation"]['val'][selected_nn_idx, :] * weights).sum(dim=1),
                     }
+                    if "f_rest" in self.gaussian_params:
+                         merged_gaussians["f_rest"] = (self.gaussian_params["f_rest"]["val"][selected_nn_idx, :] * weights).sum(dim=1)
+                    if "sg_params" in self.gaussian_params:
+                         # sg_params: (N, 1, 7)
+                         # weights: (N, 1, 1) after unsqueeze? No, weights is (M, k, 1)
+                         # selected_nn_idx: (M, k)
+                         # sg_val: (M, k, 1, 7)
+                         # weights needs to Broadcast.
+                         # weights.unsqueeze(-1) -> (M, k, 1, 1)
+                         merged_gaussians["sg_params"] = (self.gaussian_params["sg_params"]["val"][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1)
 
                     # Offload the previous Gaussians to the CPU
                     self.active_anchor.duplicate_param_dict()
@@ -1268,6 +1352,7 @@ class SceneModel:
             anchor.to("cuda", with_keyframes=True)
             self.gaussian_params = anchor.gaussian_params
             self.anchor_weights[anchor_id] = 1
+            # self.active_frames_gpu = anchor.keyframe_ids
             self.reset_optimizer()
 
             # # Ensure other anchors are on cpu to save memory
@@ -1281,3 +1366,7 @@ class SceneModel:
             # Update the anchor and store it on cpu
             anchor.gaussian_params = self.gaussian_params
             self.anchor_weights[anchor_id] = 0
+
+            # Offload to CPU to free GPU memory
+            anchor.to("cpu", with_keyframes=True)
+            torch.cuda.empty_cache()
