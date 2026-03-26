@@ -87,7 +87,7 @@ class MiniBAInternal(nn.Module):
         Expand and organize for jacobian computation
         """
         xyz_e = xyz.unsqueeze(1).expand(-1, self.n_cams, *xyz.shape[1:])
-        Rs6D_ts = torch.cat([Rs6D.view(-1, 6), ts], dim=-1)
+        Rs6D_ts = torch.cat([Rs6D.reshape(-1, 6), ts], dim=-1)
         Rs6D_ts_e = Rs6D_ts[None].expand(self.npts, *Rs6D_ts.shape)
         f_e = f[None, None].expand(self.npts, self.n_cams, *f.shape)
         centre_e = centre[None, None].expand(self.npts, self.n_cams, *centre.shape)
@@ -332,6 +332,10 @@ class MiniBA:
         centre = torch.randn(2, device="cuda")
         uv = torch.randn(batch, npts * n_cams * 2, device="cuda")
 
+        import os
+        if "OTFNVS_MINIBA_CUDA_GRAPH" in os.environ:
+            make_cuda_graph = int(os.environ.get("OTFNVS_MINIBA_CUDA_GRAPH", 1)) == 1
+            
         if make_cuda_graph:
             self.optimizer = torch.cuda.make_graphed_callables(
                 self.optimizer, (Rs6D_init, ts_init, f_init, xyz_init, centre, uv), 10

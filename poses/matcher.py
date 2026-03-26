@@ -26,32 +26,46 @@ class Matches:
 
 
 # Adapted from https://github.com/verlab/accelerated_features
-def match(feats1, feats2, min_cossim=0.82):
+def match(feats1, feats2, min_cossim=0.82,
+          sem_feats1=None, sem_feats2=None, sem_weight=0.0):
     # torch.cuda.empty_cache()
-    cossim = feats1 @ feats2.t()
+    xfeat_cossim = feats1 @ feats2.t()
 
-    bestcossim, match12 = cossim.max(dim=1)
+    # Use fused score for mutual nearest neighbor assignment,
+    # but keep XFeat-only score for threshold filtering (better calibrated)
+    if sem_feats1 is not None and sem_feats2 is not None and sem_weight > 0:
+        sem_cossim = sem_feats1 @ sem_feats2.t()
+        cossim = (1 - sem_weight) * xfeat_cossim + sem_weight * sem_cossim
+    else:
+        cossim = xfeat_cossim
+
+    bestcossim_fused, match12 = cossim.max(dim=1)
     _, match21 = cossim.max(dim=0)
 
     idx0 = torch.arange(match12.shape[0], device=match12.device)
     mask = match21[match12] == idx0
 
+    # Apply threshold on XFeat score only (well-calibrated, not affected by PCA quality)
     if min_cossim > 0:
-        mask *= bestcossim > min_cossim
+        bestcossim_xfeat = xfeat_cossim[idx0, match12]
+        mask *= bestcossim_xfeat > min_cossim
 
     return idx0, match12, mask
 
 
+
 class Matcher:
     @torch.no_grad()
-    def __init__(self, fundmat_samples: int, max_error: float):
+    def __init__(self, fundmat_samples: int, max_error: float, sem_weight: float = 0.0):
         """
         Initialize the Matcher.
         Args:
             fundmat_samples (int): Number of RANSAC etimations when estimating inliers with fundamental matrix estimation.
             max_error (float): Maximum error for RANSAC inlier threshold.
+            sem_weight (float): Weight of semantic similarity in matching score (0-1).
         """
         self.max_error = max_error
+        self.sem_weight = sem_weight
         self.fundmat_estimator = RANSACEstimator(
             fundmat_samples, max_error, EstimatorType.FUNDAMENTAL_8PTS
         )
@@ -62,7 +76,12 @@ class Matcher:
         """
         Get the number of matches between two sets of described keypoints.
         """
-        _, _, mask = match(desc_kpts.feats.cuda(), desc_kpts_other.feats.cuda())
+        _, _, mask = match(
+            desc_kpts.feats.cuda(), desc_kpts_other.feats.cuda(),
+            sem_feats1=desc_kpts.sem_feats.cuda() if desc_kpts.sem_feats is not None else None,
+            sem_feats2=desc_kpts_other.sem_feats.cuda() if desc_kpts_other.sem_feats is not None else None,
+            sem_weight=self.sem_weight,
+        )
         return mask.sum()
 
     @torch.no_grad()
@@ -88,7 +107,10 @@ class Matcher:
             Matches: A Matches object containing the matched keypoints and their indices.
         """
         idx, idx_other, mask = match(
-            desc_kpts.feats.cuda(), desc_kpts_other.feats.cuda()
+            desc_kpts.feats.cuda(), desc_kpts_other.feats.cuda(),
+            sem_feats1=desc_kpts.sem_feats.cuda() if desc_kpts.sem_feats is not None else None,
+            sem_feats2=desc_kpts_other.sem_feats.cuda() if desc_kpts_other.sem_feats is not None else None,
+            sem_weight=self.sem_weight,
         )
         idx = idx[mask]
         idx_other = idx_other[mask]
@@ -99,7 +121,7 @@ class Matcher:
         kpts_all = kpts
         kpts_other_all = kpts_other
 
-        if remove_outliers:
+        if remove_outliers and len(kpts) >= self.fundmat_estimator.m:
             F, mask = self.fundmat_estimator(kpts, kpts_other)
             idx = idx[mask]
             idx_other = idx_other[mask]

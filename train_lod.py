@@ -11,6 +11,7 @@
 
 import os
 import time
+import csv
 
 import numpy as np
 import torch
@@ -39,6 +40,69 @@ from resource_tracker import ResourceTracker
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+
+def _append_loss_record(records, stats, phase, lod, step_idx):
+    if stats is None:
+        return step_idx
+    records.append(
+        {
+            "step": step_idx,
+            "phase": phase,
+            "lod": lod,
+            "total": stats["total"],
+            "l1": stats["l1"],
+            "ssim": stats["ssim"],
+            "depth": stats["depth"],
+        }
+    )
+    return step_idx + 1
+
+
+def _save_loss_records_and_plot(records, out_dir):
+    if len(records) == 0:
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, "loss_records.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["step", "phase", "lod", "total", "l1", "ssim", "depth"]
+        )
+        writer.writeheader()
+        writer.writerows(records)
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        steps = [row["step"] for row in records]
+        total = [row["total"] for row in records]
+        l1 = [row["l1"] for row in records]
+        ssim = [row["ssim"] for row in records]
+        depth = [row["depth"] for row in records]
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        axes[0].plot(steps, total, color="tab:blue", linewidth=1.2, label="total")
+        axes[0].set_ylabel("Total Loss")
+        axes[0].grid(alpha=0.3)
+        axes[0].legend(loc="upper right")
+
+        axes[1].plot(steps, l1, color="tab:orange", linewidth=1.0, label="l1")
+        axes[1].plot(steps, ssim, color="tab:green", linewidth=1.0, label="ssim")
+        axes[1].plot(steps, depth, color="tab:red", linewidth=1.0, label="depth")
+        axes[1].set_xlabel("Optimization Step")
+        axes[1].set_ylabel("Component Loss")
+        axes[1].grid(alpha=0.3)
+        axes[1].legend(loc="upper right")
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "loss_curve.png"), dpi=180)
+        plt.close(fig)
+    except Exception as e:
+        print(f"[LossPlot] Skip plotting due to error: {e}")
+
 if __name__ == "__main__":
 
     torch.random.manual_seed(0)
@@ -60,7 +124,8 @@ if __name__ == "__main__":
     print("Initializing modules and running just in time compilation, may take a while...")
     max_error = max(args.match_max_error * width, 1.5)
     min_displacement = max(args.min_displacement * width, 30)
-    matcher = Matcher(args.fundmat_samples, max_error)
+    matcher = Matcher(args.fundmat_samples, max_error,
+                      sem_weight=args.sem_weight if args.use_semantic_features else 0.0)
     triangulator = Triangulator(
         args.num_kpts, args.num_prev_keyframes_miniba_incr, max_error
     )
@@ -71,7 +136,13 @@ if __name__ == "__main__":
     dense_extractor = DenseExtractor(width, height)
     depth_estimator = MonoDepthEstimator(width, height)
     scene_model = SceneModel(width, height, args, matcher)
-    detector = Detector(args.num_kpts, width, height)
+    # Semantic extractor (optional)
+    semantic_extractor = None
+    if args.use_semantic_features:
+        from poses.semantic_extractor import SemanticExtractor
+        semantic_extractor = SemanticExtractor(width, height, sem_dim=args.sem_feat_dim)
+        print(f"Semantic features enabled (dim={args.sem_feat_dim}, weight={args.sem_weight})")
+    detector = Detector(args.num_kpts, width, height, semantic_extractor=semantic_extractor)
 
     # Initialize the viewer
     if args.viewer_mode in ["server", "local"]:
@@ -103,6 +174,8 @@ if __name__ == "__main__":
     # runtimes = ["Load", "BAB", "tri", "BAI", "Add", "Init", "Opt", "anc"]
     # runtimes = {key: [0, 0] for key in runtimes}
     metrics = {}
+    loss_records = []
+    loss_step_idx = 0
 
     ## Scene reconstruction
     print(f"Starting reconstruction for {args.source_path}")
@@ -204,7 +277,14 @@ if __name__ == "__main__":
                     if is_stream:
                         scene_model.optimize_async(args.num_iterations)
                     else:
-                        scene_model.optimization_loop(args.num_iterations)
+                        loss_stats = scene_model.optimization_loop(args.num_iterations)
+                        loss_step_idx = _append_loss_record(
+                            loss_records,
+                            loss_stats,
+                            phase="bootstrap_opt",
+                            lod=scene_model.current_lod,
+                            step_idx=loss_step_idx,
+                        )
                 # increment_runtime(runtimes["Opt"], start_time)
                 last_reboot = n_keyframes
 
@@ -240,14 +320,20 @@ if __name__ == "__main__":
                     for i in range(3, 0, -1):
                         scene_model.add_new_gaussians(-i)
                     for _ in range(3 * args.num_iterations):
-                        scene_model.optimization_step()
+                        loss_stats = scene_model.optimization_step()
+                        loss_step_idx = _append_loss_record(
+                            loss_records,
+                            loss_stats,
+                            phase="reboot_opt",
+                            lod=scene_model.current_lod,
+                            step_idx=loss_step_idx,
+                        )
                     needs_reboot = False
                     last_reboot = n_keyframes
 
             ## Incremental reconstruction
             # Incremental pose initialization
             if n_keyframes >= args.num_keyframes_miniba_bootstrap:
-                # start_time = time.time()
                 with tracker.track("tri"):
                     prev_keyframes = scene_model.get_prev_keyframes(
                         args.num_prev_keyframes_miniba_incr, True, desc_kpts
@@ -295,7 +381,14 @@ if __name__ == "__main__":
                         if is_stream:
                             scene_model.optimize_async(args.num_iterations)
                         else:
-                            scene_model.optimization_loop(args.num_iterations)
+                            loss_stats = scene_model.optimization_loop(args.num_iterations)
+                            loss_step_idx = _append_loss_record(
+                                loss_records,
+                                loss_stats,
+                                phase="incremental_opt",
+                                lod=scene_model.current_lod,
+                                step_idx=loss_step_idx,
+                            )
                     # increment_runtime(runtimes["Opt"], start_time)
                 else:
                     should_add_keyframe = False
@@ -370,6 +463,9 @@ if __name__ == "__main__":
     )
     tracker.print_stats()
 
+    # Save failure log
+    pose_initializer.save_failure_log(args.model_path)
+
     # Fine tuning after initial reconstruction
     # Fine tuning and LoD progression
     finetune_epochs_per_level = 0
@@ -393,7 +489,14 @@ if __name__ == "__main__":
                 # Run one epoch of fine-tuning
                 epoch_start_time = time.time()
                 with tracker.track(f"LoD_{current_lod_step}"):
-                    scene_model.finetune_epoch()
+                    loss_stats = scene_model.finetune_epoch()
+                    loss_step_idx = _append_loss_record(
+                        loss_records,
+                        loss_stats,
+                        phase=f"finetune_lod_{current_lod_step}",
+                        lod=current_lod_step,
+                        step_idx=loss_step_idx,
+                    )
                 epoch_time = time.time() - epoch_start_time
                 reconstruction_time += epoch_time
             # save each epoch
@@ -434,7 +537,14 @@ if __name__ == "__main__":
             scene_model.inference_mode = False
             epoch_start_time = time.time()
             with tracker.track(f"LoD_{current_lod_step}_extra"):
-                scene_model.finetune_epoch()
+                loss_stats = scene_model.finetune_epoch()
+                loss_step_idx = _append_loss_record(
+                    loss_records,
+                    loss_stats,
+                    phase=f"finetune_lod_{current_lod_step}_extra",
+                    lod=current_lod_step,
+                    step_idx=loss_step_idx,
+                )
             reconstruction_time += time.time() - epoch_start_time
 
             lod_gate = lod_progressive_ready(
@@ -449,14 +559,21 @@ if __name__ == "__main__":
                 f"proj_mean={lod_gate['projection_error_mean']:.3f}px"
             )
 
-        # Save checkpoint at the end of each LoD level to a dedicated folder
-        # This supports the request: "different level have different ply" and folders
-        save_dir = os.path.join(args.model_path, f"lod_{current_lod_step}")
-        if not os.path.exists(save_dir):
-            scene_model.inference_mode = True
-            print(f"Saving LoD {current_lod_step} completion checkpoint to {save_dir}")
-            scene_model.save(save_dir, reconstruction_time, save_with_lod_suffix=True)
-            scene_model.inference_mode = False
+        # Save checkpoint at the end of each LoD level.
+        # Single-LoD: save into model_path directly.
+        # Multi-LoD: create a flat sibling directory name with LoD-X-X-X style.
+        if args.lod_min == args.lod_max:
+            save_dir = args.model_path
+        else:
+            base_parent = os.path.dirname(os.path.normpath(args.model_path))
+            base_name = os.path.basename(os.path.normpath(args.model_path))
+            lod_tag = f"LoD-{args.lod_min}-{current_lod_step}-{args.lod_max}"
+            save_dir = os.path.join(base_parent, f"{base_name}_{lod_tag}")
+
+        scene_model.inference_mode = True
+        print(f"Saving LoD {current_lod_step} completion checkpoint to {save_dir}")
+        scene_model.save(save_dir, reconstruction_time)
+        scene_model.inference_mode = False
 
         # Increase LoD if not at max
         if current_lod_step < args.lod_max:
@@ -478,6 +595,7 @@ if __name__ == "__main__":
     # Print final resource usage stats including LoD phases
     tracker.print_stats()
     tracker.save_stats(os.path.join(args.model_path, "resource_stats.txt"))
+    _save_loss_records_and_plot(loss_records, args.model_path)
 
 
     if args.viewer_mode != "none":

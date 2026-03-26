@@ -11,6 +11,8 @@
 
 import torch
 import math
+import csv
+import os
 
 from poses.feature_detector import DescribedKeypoints
 from poses.mini_ba import MiniBA
@@ -55,6 +57,79 @@ class PoseInitializer():
             make_cuda_graph=True, iters=args.iters_miniba_incr)
         
         self.PnPRANSAC = RANSACEstimator(args.pnpransac_samples, self.max_pnp_error, EstimatorType.P4P)
+
+        # Failure logging
+        self.failure_log = []
+
+        # Smooth camera interpolation fallback
+        self.consecutive_failures = 0
+        self.max_consecutive_extrapolations = 3
+
+        # Camera track extrapolation settings
+        self.use_track_extrapolation = getattr(args, 'use_track_extrapolation', False)
+        self.track_extrapolation_window = getattr(args, 'track_extrapolation_window', 3)
+
+    def _extrapolate_pose(self, keyframes):
+        """
+        Extrapolate the next camera pose from recent keyframe trajectory.
+        Returns (Rs6D_init, ts_init) as initial values for PnP.
+        Falls back to keyframes[0] pose if extrapolation is unreliable.
+        """
+        if not self.use_track_extrapolation or len(keyframes) < 2:
+            return keyframes[0].rW2C, keyframes[0].tW2C
+
+        try:
+            # Collect recent poses (sorted by proximity, take first few)
+            n = min(self.track_extrapolation_window, len(keyframes))
+            recent_kfs = keyframes[:n]
+
+            # Get translations and rotations
+            ts = torch.stack([kf.tW2C for kf in recent_kfs])  # [n, 3]
+            Rs = torch.stack([sixD2mtx(kf.rW2C[None])[0] for kf in recent_kfs])  # [n, 3, 3]
+
+            # Linear velocity extrapolation on translation
+            if n >= 2:
+                # Use the two closest keyframes to estimate velocity
+                v = ts[0] - ts[1]  # velocity from second-closest to closest
+                t_pred = ts[0] + v
+            else:
+                t_pred = ts[0]
+
+            # Rotation extrapolation: R_pred = R_delta @ R_closest
+            if n >= 2:
+                R_delta = Rs[0] @ Rs[1].T
+                R_pred = R_delta @ Rs[0]
+            else:
+                R_pred = Rs[0]
+
+            # Sanity check: if the predicted translation is too far, fallback
+            pred_dist = torch.norm(t_pred - ts[0])
+            avg_dist = torch.norm(ts[0] - ts[min(1, n - 1)])
+            if pred_dist > 5 * avg_dist + 1e-6:
+                return keyframes[0].rW2C, keyframes[0].tW2C
+
+            # Convert R_pred back to 6D representation (first two columns)
+            Rs6D_pred = R_pred[:, :2]  # [3, 2]
+            return Rs6D_pred, t_pred
+
+        except Exception:
+            return keyframes[0].rW2C, keyframes[0].tW2C
+
+    def save_failure_log(self, path: str):
+        """Save failure log to CSV file."""
+        if not self.failure_log:
+            return
+        csv_path = os.path.join(path, "failure_log.csv")
+        os.makedirs(path, exist_ok=True)
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["frame_index", "total_2d3d_matches", "pnp_inliers",
+                            "miniba_inliers", "threshold"],
+            )
+            writer.writeheader()
+            writer.writerows(self.failure_log)
+        print(f"Failure log saved to {csv_path} ({len(self.failure_log)} entries)")
 
     def build_problem(self,
                       desc_kpts_list: list[DescribedKeypoints],
@@ -207,6 +282,8 @@ class PoseInitializer():
         uvs = torch.cat(uvs, dim=0)
         confs = torch.cat(confs, dim=0)
         match_indices = torch.cat(match_indices, dim=0)
+        total_matches_count = len(xyz)
+        # print(f"[Debug] Total 2D-3D matches: {total_matches_count}")
 
         # Subsample the points if there are too many
         if len(xyz) > self.num_pts_pnpransac:
@@ -217,9 +294,9 @@ class PoseInitializer():
             match_indices = match_indices[selected_indices]
 
         # Estimate an initial camera pose and inliers using PnP RANSAC
-        Rs6D_init = keyframes[0].rW2C
-        ts_init = keyframes[0].tW2C
+        Rs6D_init, ts_init = self._extrapolate_pose(keyframes)
         Rt, inliers = self.PnPRANSAC(uvs, xyz, self.f, self.centre, Rs6D_init, ts_init, confs)
+        # print(f"[Debug] PnP RANSAC inliers: {inliers.sum().item()}")
 
         xyz = xyz[inliers]
         uvs = uvs[inliers]
@@ -237,18 +314,38 @@ class PoseInitializer():
 
         # Run the initialization
         Rs6D, ts = Rt[:3, :2][None], Rt[:3, 3][None]
-        Rs6D, ts, _, _, r, r_init, mask = self.miniBA_incr(Rs6D, ts, self.f, xyz_ba, self.centre, uvs_ba.view(-1))
+        Rs6D, ts, _, _, r, r_init, mask = self.miniBA_incr(Rs6D, ts, self.f, xyz_ba, self.centre, uvs_ba.reshape(-1))
         Rt = torch.eye(4, device="cuda")
         Rt[:3, :3] = sixD2mtx(Rs6D)[0]
         Rt[:3, 3] = ts[0]
 
         # Check if we have sufficiently many inliers
         if is_test or mask.sum() > self.min_num_inliers:
-            # Return the pose of the current frame
+            self.consecutive_failures = 0
             return Rt
         else:
-            print("Too few inliers for pose initialization")
-            # Remove matches as we prevent the current frame from being registered
+            self.consecutive_failures += 1
+            print(f"Too few inliers for pose initialization (frame {index}), consecutive_failures={self.consecutive_failures}")
+            # Log failure
+            self.failure_log.append({
+                "frame_index": index,
+                "total_2d3d_matches": total_matches_count,
+                "pnp_inliers": int(inliers.sum().item()),
+                "miniba_inliers": int(mask.sum().item()),
+                "threshold": self.min_num_inliers,
+            })
+
+            # Smooth camera interpolation fallback: use extrapolated pose
+            # instead of dropping the frame entirely, preventing tracking gaps during turns
+            if self.consecutive_failures <= self.max_consecutive_extrapolations and self.use_track_extrapolation and len(keyframes) >= 2:
+                Rs6D_extrap, ts_extrap = self._extrapolate_pose(keyframes)
+                Rt_fallback = torch.eye(4, device="cuda")
+                Rt_fallback[:3, :3] = sixD2mtx(Rs6D_extrap[None])[0]
+                Rt_fallback[:3, 3] = ts_extrap
+                print(f"  -> Using smooth extrapolated pose as fallback")
+                return Rt_fallback
+
+            # Too many consecutive failures: give up and let the reboot mechanism handle it
             for keyframe in keyframes:
                 keyframe.desc_kpts.matches.pop(index, None)
             return None

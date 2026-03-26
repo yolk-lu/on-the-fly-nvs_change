@@ -11,6 +11,8 @@
 
 import torch
 import torch.nn as nn
+import warnings
+import os
 
 from poses.feature_detector import DescribedKeypoints
 from utils import depth2points, pts2px
@@ -27,8 +29,8 @@ def matches_to_points(uv, uv_matched, R, t, f, centre):
     d2 = d2 / torch.linalg.vector_norm(d2, dim=-1, keepdim=True)
 
     # Compute the normal vector and its secondary vector
-    n = torch.cross(d1, d2, dim=-1)  # [N, 3]
-    n2 = torch.cross(d2, n, dim=-1)  # [N, 3]
+    n = torch.cross(d1, d2, dim=-1)  # [N, 3]\
+    n2 = torch.cross(d2, n, dim=-1)  # [N, 3]\
 
     # Compute distances
     dist = torch.matmul(n2, p2.T) / torch.bmm(n2.unsqueeze(1), d1.unsqueeze(-1)).squeeze(-1)
@@ -100,9 +102,19 @@ class Triangulator():
         centre = torch.rand(2, device="cuda")
         self.max_error = torch.tensor(max_error, device="cuda")
         self.min_dis = torch.tensor(max_error * 30, device="cuda")
-        
-        self.model = torch.cuda.make_graphed_callables(
-            self.model, (uv, uvs_others, Rt, Rts_others, f, centre, self.max_error, self.min_dis))
+
+        use_cuda_graph = os.environ.get("OTFNVS_TRIANGULATOR_CUDA_GRAPH", "1") not in ("0", "false", "False")
+        if use_cuda_graph:
+            try:
+                self.model = torch.cuda.make_graphed_callables(
+                    self.model, (uv, uvs_others, Rt, Rts_others, f, centre, self.max_error, self.min_dis)
+                )
+            except RuntimeError as error:
+                warnings.warn(
+                    "Triangulator CUDA graph capture failed; falling back to eager execution. "
+                    f"Set OTFNVS_TRIANGULATOR_CUDA_GRAPH=0 to disable graph capture. Error: {error}",
+                    RuntimeWarning,
+                )
 
     def __call__(self, uv, uvs_others, Rt, Rts_others, f, centre):
         return self.model(uv, uvs_others, Rt, Rts_others, f, centre, self.max_error, self.min_dis)

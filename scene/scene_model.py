@@ -24,21 +24,7 @@ import numpy as np
 
 import lpips
 from fused_ssim import fused_ssim
-
-# original
-# from diff_gaussian_rasterization import (
-#     GaussianRasterizationSettings,
-#     GaussianRasterizer,
-# )
-
-# for SG only
-# from diff_gaussian_rasterization_SG import (
-#     GaussianRasterizationSettings,
-#     GaussianRasterizer,
-# )
-
-# for SH-Mix-SG
-from diff_gaussian_rasterization_SH_MIX_SG import (
+from diff_gaussian_rasterization import (
     GaussianRasterizationSettings,
     GaussianRasterizer,
 )
@@ -49,6 +35,12 @@ from poses.guided_mvs import GuidedMVS
 from scene.optimizers import SparseGaussianAdam
 from scene.keyframe import Keyframe
 from scene.anchor import Anchor
+from scene.LoD_utils import (
+    projected_major_axis_px,
+    distance_boundary_penalty,
+    gaussian_aspect_ratio_mask,
+    aspect_ratio_penalty,
+)
 from utils import (
     RGB2SH,
     depth2points,
@@ -102,20 +94,8 @@ class SceneModel:
         except:
             self.lpips = None
 
-        # LoD initialization (Moved out of inference_mode block to support rendering)
-        self.lod_min = getattr(args, 'lod_min', 1)
-        self.lod_max = getattr(args, 'lod_max', 1)
-        self.lod1_scaling_lower_bound = getattr(args, 'lod1_scaling_lower_bound', 0.001)
-        self.lod_scaling_ratio = getattr(args, 'lod_scaling_ratio', 2.0)
-        self.increase_lod_num_childs = getattr(args, 'increase_lod_num_childs', 2)
-        self.lod_min_sample_ratio = getattr(args, 'lod_min_sample_ratio', 0.4)
-        self.lod_merge_voxel_factor = getattr(args, 'lod_merge_voxel_factor', 4.0)
-        self.lod_merge_min_points = getattr(args, 'lod_merge_min_points', 256)
-        self.lod_blur_scale_boost = getattr(args, 'lod_blur_scale_boost', 0.25)
-        self.current_lod = self.lod_min
-        self.setup_scaling_activation()
-
         if not inference_mode:
+            self.current_lod = getattr(args, "lod_min", 1)
             self.num_prev_keyframes_check = args.num_prev_keyframes_check
             self.active_sh_degree = args.sh_degree
             self.max_sh_degree = args.sh_degree
@@ -133,11 +113,7 @@ class SceneModel:
                 }
             }
 
-
             ## Initialize Gaussian parameters
-            # TODO:  修改f_rest(SH的degree 1~3) 
-
-
             self.gaussian_params = {
                 "xyz": {
                     "val": torch.empty(0, 3, device="cuda"),
@@ -147,30 +123,15 @@ class SceneModel:
                     "val": torch.empty(0, 1, 3, device="cuda"),
                     "lr": args.feature_lr,
                 },
-
-                # original 
-                # "f_rest": {
-                #     "val": torch.empty(
-                #         0,
-                #         (self.max_sh_degree + 1) * (self.max_sh_degree + 1) - 1,
-                #         3,
-                #         device="cuda",
-                #     ),
-                #     "lr": args.feature_lr / 20.0,
-                # },
-
-                # Define Spherical Gaussian Coefficients : Axis(3) + Sharpness(1) + Amplitude(3)
-                # "f_rest":{
-                #   "val": torch.empty(0, 7, 3, device="cuda"),
-                #   "lr": args.feature_lr
-                # },
-                #
-                #
                 "f_rest": {
-                    "val": torch.empty(0, 7, device="cuda"),
-                    "lr": args.feature_lr
+                    "val": torch.empty(
+                        0,
+                        (self.max_sh_degree + 1) * (self.max_sh_degree + 1) - 1,
+                        3,
+                        device="cuda",
+                    ),
+                    "lr": args.feature_lr / 20.0,
                 },
-
                 "scaling": {
                     "val": torch.empty(0, 3, device="cuda"),
                     "lr": args.scaling_lr,
@@ -228,6 +189,15 @@ class SceneModel:
             .cuda()
         )
 
+    def verify_no_nans(self, context=""):
+        for k, v in self.gaussian_params.items():
+            if torch.isnan(v["val"]).any() or torch.isinf(v["val"]).any():
+                print(f"\n[FATAL] NaN/Inf detected in {k} at '{context}'!!!\n")
+                import sys; sys.exit(1)
+        if len(self.keyframes) > 0 and torch.isnan(self.keyframes[-1].get_Rt()).any():
+            print(f"\n[FATAL] NaN detected in Camera Poses at '{context}'!!!\n")
+            import sys; sys.exit(1)
+
     def reset_optimizer(self):
         for key in self.gaussian_params:
             if not self.gaussian_params[key]["val"].requires_grad:
@@ -235,95 +205,6 @@ class SceneModel:
         self.optimizer = SparseGaussianAdam(
             self.gaussian_params, (0.5, 0.99), lr_dict=self.lr_dict
         )
-
-    def setup_scaling_activation(self):
-        if self.current_lod < self.lod_max:
-            self.scaling_lower_bound = self.lod1_scaling_lower_bound / self.lod_scaling_ratio ** (self.current_lod - 1)
-        else:
-            self.scaling_lower_bound = 0.0
-
-    def increase_lod(self):
-        if self.current_lod >= self.lod_max:
-            return
-
-        scaling_lower_bound_old = self.scaling_lower_bound
-        self.current_lod += 1
-        self.setup_scaling_activation()
-        scaling_lower_bound_new = self.scaling_lower_bound
-        
-        # Increase LoD for all anchors
-        for anchor in self.anchors:
-            # Uniform Splitting (FLoD Style): Split all Gaussians
-            # This ensures that higher LODs are strictly finer representations of the whole scene
-            # allowing for proper switching between Coarse (LOD1) and Fine (LOD N) models based on distance.
-            anchor.increase_lod(self.increase_lod_num_childs, scaling_lower_bound_old, scaling_lower_bound_new)
-        
-        # Update references if active anchor was modified
-        self.gaussian_params = self.active_anchor.gaussian_params
-        
-        # Reset optimizer for new parameters
-        self.reset_optimizer()
-
-    def _lod_progress(self):
-        if self.lod_max <= self.lod_min:
-            return 1.0
-        return float(self.current_lod - self.lod_min) / float(self.lod_max - self.lod_min)
-
-    @torch.no_grad()
-    def _coarsen_extension_tensors_for_lod(self, extension_tensors: dict[str, torch.Tensor]):
-        n_pts = extension_tensors["xyz"].shape[0]
-        if n_pts < self.lod_merge_min_points:
-            return extension_tensors
-
-        lod_progress = self._lod_progress()
-        merge_strength = 1.0 - lod_progress
-        if merge_strength <= 1e-6:
-            return extension_tensors
-
-        xyz = extension_tensors["xyz"]
-        device = xyz.device
-
-        linear_scales = torch.exp(extension_tensors["scaling"]) + self.scaling_lower_bound
-        base_radius = linear_scales.mean(dim=-1).median().clamp(min=1e-6)
-        voxel_size = base_radius * (1.0 + self.lod_merge_voxel_factor * merge_strength)
-
-        vox = torch.floor(xyz / voxel_size).to(torch.int64)
-        _, inverse, counts = torch.unique(vox, dim=0, return_inverse=True, return_counts=True)
-        m = counts.shape[0]
-        if m >= n_pts:
-            return extension_tensors
-
-        alpha = torch.sigmoid(extension_tensors["opacity"]).squeeze(-1).clamp(1e-5, 1 - 1e-5)
-        importance = alpha * linear_scales.max(dim=-1).values.square()
-        importance = importance.clamp(min=1e-8)
-
-        wsum = torch.zeros(m, device=device, dtype=importance.dtype)
-        wsum.index_add_(0, inverse, importance)
-        norm = importance / wsum[inverse]
-
-        merged = {}
-        for key, tensor in extension_tensors.items():
-            if key == "opacity":
-                continue
-            flat = tensor.reshape(n_pts, -1)
-            out = torch.zeros(m, flat.shape[1], device=device, dtype=flat.dtype)
-            out.index_add_(0, inverse, flat * norm[:, None])
-            merged[key] = out.reshape(m, *tensor.shape[1:])
-
-        log_trans = torch.log((1.0 - alpha).clamp(min=1e-8))
-        sum_log_trans = torch.zeros(m, device=device, dtype=log_trans.dtype)
-        sum_log_trans.index_add_(0, inverse, log_trans)
-        merged_alpha = (1.0 - torch.exp(sum_log_trans)).clamp(1e-4, 1 - 1e-4)
-        merged["opacity"] = inverse_sigmoid(merged_alpha[:, None])
-
-        merged_counts = counts.to(linear_scales.dtype).pow(1.0 / 3.0)
-        blur_gain = 1.0 + self.lod_blur_scale_boost * merge_strength
-        merged_linear_scale = torch.exp(merged["scaling"]) + self.scaling_lower_bound
-        merged_linear_scale = merged_linear_scale * merged_counts[:, None] * blur_gain
-        merged["scaling"] = torch.log((merged_linear_scale - self.scaling_lower_bound).clamp(min=1e-6))
-
-        return merged
-
 
     @property
     def xyz(self):
@@ -339,9 +220,7 @@ class SceneModel:
 
     @property
     def scaling(self):
-        # return torch.exp(self.gaussian_params["scaling"]["val"])
-        return torch.exp(self.gaussian_params["scaling"]["val"]) + self.scaling_lower_bound
-
+        return torch.exp(self.gaussian_params["scaling"]["val"])
 
     @property
     def rotation(self):
@@ -356,8 +235,7 @@ class SceneModel:
         return self.xyz.shape[0]
 
     @classmethod
-    # def from_scene(cls, scene_dir: str, args):
-    def from_scene(cls, scene_dir: str, args, lod=None):
+    def from_scene(cls, scene_dir: str, args):
         with open(os.path.join(scene_dir, "metadata.json")) as f:
             metadata = json.load(f)
 
@@ -370,25 +248,13 @@ class SceneModel:
         # Load anchors
         scene_model.anchors = []
         for i in range(len(metadata["anchors"])):
-            anchor_filename = f"anchor_{i}_lod_{lod}.ply" if lod is not None else f"anchor_{i}.ply"
-            # If explicit LoD requested but not found, fallback or duplicate check?
-            # For now assume checking the exact file availability in calling script or just let it fail/try default.
-            # But "saved with lod" means "anchor_0_lod_X.ply".
-            # The metadata might not track filename, so this heuristic is needed.
-            
             scene_model.anchors.append(
                 Anchor.from_ply(
-                    # os.path.join(scene_dir, "point_clouds", f"anchor_{i}.ply"),
-                    os.path.join(scene_dir, "point_clouds", anchor_filename),
+                    os.path.join(scene_dir, "point_clouds", f"anchor_{i}.ply"),
                     torch.tensor(metadata["anchors"][i]["position"]),
                     metadata["config"]["sh_degree"],
                 )
             )
-
-
-        if lod is not None:
-            scene_model.current_lod = lod
-            scene_model.setup_scaling_activation()
 
         scene_model.active_anchor = scene_model.anchors[0]
 
@@ -435,8 +301,15 @@ class SceneModel:
         render_pkg = self.render_from_id(
             keyframe_id, pyr_lvl=lvl, bg=torch.rand(3, device="cuda")
         )
-        image = render_pkg["render"]
-        invdepth = render_pkg["invdepth"]
+        
+        if render_pkg["radii"].max() == 0:
+            
+            if not hasattr(self, 'latest_loss_stats'):
+                self.latest_loss_stats = {"total": 0.0, "l1": 0.0, "ssim": 0.0, "depth": 0.0}
+            return self.latest_loss_stats
+
+        image = render_pkg["render"].contiguous()
+        invdepth = render_pkg["invdepth"].contiguous()
 
         gt_image = keyframe.image_pyr[lvl]
         mono_idepth = keyframe.get_mono_idepth(lvl)
@@ -452,10 +325,19 @@ class SceneModel:
         l1_loss = (image - gt_image).abs().mean()
         ssim_loss = 1 - fused_ssim(image[None], gt_image[None])
         depth_loss = (invdepth - mono_idepth).abs().mean()
+        
+        # aspect_loss mathematically requires the raw un-exponentiated log_scaling tensor to enforce strict linear gradient limits
+        from scene.LoD_utils import aspect_ratio_penalty
+        aspect_loss = aspect_ratio_penalty(
+            self.gaussian_params["scaling"]["val"], 
+            max_aspect_ratio=getattr(self, "max_gaussian_aspect_ratio", 8.0)
+        )
+        
         loss = (
             self.lambda_dssim * ssim_loss
             + (1 - self.lambda_dssim) * l1_loss
             + keyframe.depth_loss_weight * depth_loss
+            + 0.1 * aspect_loss
         )
         loss.backward()
 
@@ -475,6 +357,16 @@ class SceneModel:
 
         self.valid_Rt_cache[keyframe_id] = False
         self.last_trained_id = keyframe_id
+        
+        self.verify_no_nans("optimization_step End")
+        
+        self.latest_loss_stats = {
+            "total": float(loss.detach().item()),
+            "l1": float(l1_loss.detach().item()),
+            "ssim": float(ssim_loss.detach().item()),
+            "depth": float(depth_loss.detach().item()),
+        }
+        return self.latest_loss_stats
 
     def optimization_loop(self, n_iters: int, run_until_interupt: bool = False):
         """
@@ -483,19 +375,18 @@ class SceneModel:
         """
         self.interupt_optimization = False
         i = 0
+        loss_stats = []
         while i < n_iters or (run_until_interupt and not self.interupt_optimization): 
-            self.optimization_step()
-
-            if i % 500 == 0:
-                 active_idx = len(self.anchors) - 1
-                 # Check points count safely
-                 n_pts = 0
-                 if hasattr(self, 'active_anchor') and 'xyz' in self.active_anchor.gaussian_params:
-                      n_pts = self.active_anchor.gaussian_params['xyz']['val'].shape[0]
-                 
-                 print(f"[Opt] Iter {i}/{n_iters}. Active Anchor {active_idx} (Points: {n_pts}). Frames: {len(self.active_frames_gpu)}")
-
+            stats = self.optimization_step()
+            if stats is not None:
+                loss_stats.append(stats)
             i += 1
+            
+        import numpy as np
+        if len(loss_stats) == 0:
+            return None
+        keys = ["total", "l1", "ssim", "depth"]
+        return {key: float(np.mean([item[key] for item in loss_stats])) for key in keys}
         
     def join_optimization_thread(self):
         """
@@ -625,17 +516,6 @@ class SceneModel:
         render_pkg["render"] = render_pkg["render"].clamp(0, 1).view(3, height, width)
         return render_pkg
 
-    def prepare_for_render(self, view_matrix):
-        """
-        Prepares the scene for rendering by blending anchors based on the view matrix.
-        Updates self.gaussian_params.
-        """
-        cam_centre = view_matrix.detach().inverse()[3, :3]
-        
-        # Load and blend anchors if in inference mode 
-        if self.inference_mode:
-            self.gaussian_params, self.anchor_weights = Anchor.blend(cam_centre, self.anchors, self.anchor_overlap)
-
     def render(
         self,
         width: int,
@@ -646,7 +526,6 @@ class SceneModel:
         top_view: bool = False,
         fov_x: float = None,
         fov_y: float = None,
-        override_params: dict = None,
     ):
         cam_centre = view_matrix.detach().inverse()[3, :3]
 
@@ -681,95 +560,54 @@ class SceneModel:
         )
         rasterizer = GaussianRasterizer(raster_settings)
         with self.lock:
-            # Prepare scene (Anchor blending) if overrides are not provided
-            # If overrides are provided, we assume the caller handled selection/blending
-            if override_params is None and not top_view:
-                self.prepare_for_render(view_matrix)
-            
-            # Use overrides if provided, otherwise use class members
-            if override_params is not None:
-                xyz = override_params.get("xyz", self.xyz)
-                scaling = override_params.get("scaling", self.scaling)
-                opacity = override_params.get("opacity", self.opacity)
-                rotation = override_params.get("rotation", self.rotation)
-                features_dc = override_params.get("features_dc", self.f_dc)
-                features_rest = override_params.get("features_rest", self.f_rest)
-            else:
-                xyz = self.xyz
-                scaling = self.scaling
-                opacity = self.opacity
-                rotation = self.rotation
-                features_dc = self.f_dc
-                features_rest = self.f_rest
-
-            screenspace_points = torch.zeros_like(xyz, requires_grad=True)
-            if xyz.shape[0] > 0:
+            # Load and blend anchors if in inference mode 
+            if self.inference_mode and not top_view:
+                self.gaussian_params, self.anchor_weights = Anchor.blend(cam_centre, self.anchors, self.anchor_overlap)
+            screenspace_points = torch.zeros_like(self.xyz, requires_grad=True)
+            if self.xyz.shape[0] > 0:
                 # Set constant scaling and opacity to visualize the Gaussians' positions in the top view
                 if top_view:
-                    scaling = torch.ones_like(scaling) * scaling_modifier
-                    opacity = torch.ones_like(opacity)
-                else: 
-                    # --- Perceptual LoD Modulation (Opacity Soft-Thresholding) ---
-                    if hasattr(self, 'perceptual_lod_config') and self.perceptual_lod_config:
-                        # Unpack config
-                        k_ecc = self.perceptual_lod_config.get('k_ecc', 0.0)
-                        # k_vel = self.perceptual_lod_config.get('k_vel', 0.0) # Not implemented yet as we need velocity
-                        tau_min = self.perceptual_lod_config.get('tau_min', 0.5)
-                        tau_max = self.perceptual_lod_config.get('tau_max', 3.0)
-                        
-                        # 1. Compute Depth and Eccentricity
-                        
-                        # Use local xyz
-                        ones = torch.ones((xyz.shape[0], 1), device=xyz.device)
-                        xyz_h = torch.cat([xyz, ones], dim=1)
-                        
-                        # Transform to Camera Space
-                        P_cam = xyz_h @ view_matrix # (N, 4)
-                        depth = P_cam[:, 2]
-                        depth = torch.clamp(depth, min=0.01) # Avoid div by zero
-                        
-                        # Project to Screen (NDC)
-                        P_clip = xyz_h @ projection_matrix # (N, 4)
-                        w_clip = P_clip[:, 3]
-                        inv_w = 1.0 / (w_clip + 1e-7)
-                        x_ndc = P_clip[:, 0] * inv_w
-                        y_ndc = P_clip[:, 1] * inv_w
-                        
-                        # Eccentricity (Distance from center in NDC)
-                        e = torch.sqrt(x_ndc**2 + y_ndc**2)
-                        
-                        # Weight Factors
-                        W_ecc = 1.0 / (1.0 + k_ecc * e)
-                        W_percept = W_ecc 
-                        
-                        # Effective Radius
-                        # Get max scale
-                        s = torch.max(scaling, dim=1).values
-                        
-                        # Focal length f (pixels)
-                        f_x = width / (2.0 * tanfovx)
-                        f_y = height / (2.0 * tanfovy)
-                        f = (f_x + f_y) * 0.5
-                        
-                        r = (s * f) / depth
-                        r_hat = r * W_percept
-                        
-                        # Soft Thresholding
-                        t = torch.clamp((r_hat - tau_min) / (tau_max - tau_min), 0.0, 1.0)
-                        modulation = t * t * (3.0 - 2.0 * t)
-                        
-                        opacity = opacity * modulation.unsqueeze(-1)
-
-                color, invdepth, mainGaussID, radii = rasterizer(
-                    xyz,
-                    screenspace_points,
-                    opacity,
-                    features_dc,
-                    features_rest,
-                    scaling,
-                    rotation,
-                    view_matrix,
-                )
+                    scaling = torch.ones_like(self.scaling) * scaling_modifier
+                    opacity = torch.ones_like(self.opacity)
+                else:
+                    dist = torch.linalg.vector_norm(self.xyz - cam_centre[None], dim=-1).clamp_min(1e-5)
+                    # Compute projected size and shrink any Gaussian that attempts to dominate the screen
+                    # This is the ULTIMATE mathematical protection against C++ array memory crashes (Rasterizer OOMs acting as illegal memory access)
+                    max_scale = self.scaling.max(dim=-1)[0]
+                    screen_size = self.f * max_scale / dist
+                    shrink_factor = 200.0 / screen_size.clamp_min(200.0)
+                    scaling = self.scaling * shrink_factor.unsqueeze(-1)
+                    opacity = self.opacity
+                    
+                actual_rot = self.rotation.contiguous()
+                if (actual_rot == 0).all(dim=-1).any():
+                    print("\n[FATAL] A Gaussian quaternion has an EXACT norm of 0! This will trigger a division-by-zero crash in the C++ rasterizer!\n")
+                    import sys; sys.exit(1)
+                if torch.isnan(scaling).any() or torch.isinf(scaling).any():
+                    print("\n[FATAL] Scaling passed to rasterizer contains NaN or Inf!\n")
+                    import sys; sys.exit(1)
+                    
+                try:
+                    color, invdepth, mainGaussID, radii = rasterizer(
+                        self.xyz.contiguous(),
+                        screenspace_points.contiguous(),
+                        opacity.contiguous(),
+                        self.f_dc.contiguous(),
+                        self.f_rest.contiguous(),
+                        scaling.contiguous(),
+                        actual_rot,
+                        view_matrix.contiguous(),
+                    )
+                except RuntimeError as e:
+                    if "CUDA" in str(e):
+                        print(f"\n[WARNING] Rasterizer CUDA error caught and recovered: {e}\n")
+                        torch.cuda.synchronize()
+                        color = torch.zeros(3, height, width, device="cuda")
+                        invdepth = torch.zeros(1, height, width, device="cuda")
+                        mainGaussID = torch.zeros(1, height, width, device="cuda", dtype=torch.int32)
+                        radii = torch.zeros(self.xyz.shape[0], device="cuda", dtype=torch.int32)
+                    else:
+                        raise
             else:
                 # If no Gaussians are present, return empty tensors
                 color = torch.zeros(3, height, width, device="cuda")
@@ -905,19 +743,40 @@ class SceneModel:
             init_proba *= dilated_mask
 
         ## Compute the penalty based on the rendering from the new keyframe's point of view
-        penalty = 0
+        penalty = torch.zeros_like(init_proba)
         rendered_depth = None
         if self.xyz.shape[0] > 0:
+            self.verify_no_nans("add_new_gaussians Before Render")
             render_pkg = self.render_from_id(keyframe_id)
-            render = render_pkg["render"]
+            render = render_pkg["render"].detach()
             rendered_depth = 1 / render_pkg["invdepth"][0].clamp_min(1e-8)
             penalty = get_lapla_norm(render, self.disc_kernel)
 
+        penalty = distance_boundary_penalty(
+            penalty,
+            self.uv,
+            self.width,
+            self.height,
+            rendered_depth=rendered_depth,
+            boundary_weight=getattr(self, "boundary_penalty_weight", 0.35),
+            distance_weight=getattr(self, "distance_penalty_weight", 0.20),
+            boundary_margin_ratio=getattr(self, "boundary_penalty_margin_ratio", 0.08),
+        )
+
         ## Define which pixels should become Gaussians
-        init_proba *= self.init_proba_scaler
-        penalty *= self.init_proba_scaler
-        lod_sample_ratio = self.lod_min_sample_ratio + (1.0 - self.lod_min_sample_ratio) * self._lod_progress()
-        sample_mask = torch.rand_like(init_proba) < (init_proba - penalty) * lod_sample_ratio # eq. 3 + LoD factor
+        # Enforce resolution-independent spawn rates to prevent linear Gaussian inflation (and GPU OOM) at lower downsamplings
+        res_multiplier = (480.0 * 270.0) / (self.width * self.height)
+        eff_scaler = self.init_proba_scaler * res_multiplier
+        init_proba *= eff_scaler
+        penalty *= eff_scaler
+        
+        # Apply Distance-based LoD Density multiplier
+        from scene.LoD_utils import get_lod_density
+        depth_val = 1 / render_pkg["invdepth"][0].clamp_min(1e-8) if self.xyz.shape[0] > 0 else torch.zeros_like(init_proba)
+        density_mult = get_lod_density(depth_val[None])
+        
+        sample_proba = (init_proba - penalty) * density_mult[0]
+        sample_mask = torch.rand_like(init_proba) < sample_proba # eq. 3
 
         sampled_uv = self.uv[sample_mask]
         ## Initialize positions
@@ -930,7 +789,7 @@ class SceneModel:
                 prev_KFs.pop(i)
                 break
         depth, accurate_mask = self.guided_mvs(sampled_uv, keyframe, prev_KFs)
-        valid_mask = (keyframe.sample_conf(sampled_uv) > 0.5) * (depth > 1e-6)
+        valid_mask = (keyframe.sample_conf(sampled_uv) > 0.5) * (depth > 1e-6) * torch.isfinite(depth)
         sample_mask[sample_mask.clone()] = valid_mask
         depth = depth[valid_mask]
         sampled_uv = sampled_uv[valid_mask]
@@ -984,9 +843,11 @@ class SceneModel:
         f_dc = RGB2SH(f_dc.permute(1, 0).unsqueeze(1))
 
         ## Initialize Scales
-        sampled_init_proba = init_proba[sample_mask]
+        # Undo the memory-saving artificial sparsity multiplier `res_multiplier` before calculating physical base scale
+        # This prevents Gaussians from artificially inflating 2.6x to compensate for the lower spawn probability
+        sampled_init_proba = init_proba[sample_mask] / res_multiplier
         match_init_proba = F.grid_sample(
-            init_proba[None, None],
+            (init_proba / res_multiplier)[None, None],
             match_sampler[None, None],
             mode="bilinear",
             align_corners=True,
@@ -1013,40 +874,12 @@ class SceneModel:
         opacities = inverse_sigmoid(opacities)
 
         ## Initialize SH, rotations as identity
-
-#------------------------------------------------------------------------------------------------------------------
-        # TODO: 修改f_rest的初始值, 因為現在使用SG取代, 所以不能設定成0
-
-        # Original
-        # f_rest = torch.zeros(
-        #     f_dc.shape[0],
-        #     (self.max_sh_degree + 1) * (self.max_sh_degree + 1) - 1,
-        #     3,
-        #     device="cuda",
-        # )
-
-
-        # Change
- 
-        # Axis
-        # 相機的中心視角
-        cam_center = keyframe.approx_centre
-        
-        # 計算點到相機的方向向量
-        dir_to_cam = cam_center[None, :] - new_pts
-        init_axis = F.normalize(dir_to_cam, dim=-1)  # 單位向量
-
-        #Sharpness
-        init_sharpness = torch.ones(new_pts.shape[0], 1, device="cuda") * 2.0  # 初始銳度值
-
-        # Amplitude
-        init_amplitude = inverse_sigmoid(torch.ones(new_pts.shape[0], 3, device='cuda') * 0.1)
-
-        # concatenate SG parameters
-        f_rest = torch.cat([init_axis, init_sharpness, init_amplitude], dim=1)
-
-#------------------------------------------------------------------------------------------------------------------
-
+        f_rest = torch.zeros(
+            f_dc.shape[0],
+            (self.max_sh_degree + 1) * (self.max_sh_degree + 1) - 1,
+            3,
+            device="cuda",
+        )
         rots = torch.zeros(f_dc.shape[0], 4, device="cuda")
         rots[:, 0] = 1
 
@@ -1060,7 +893,11 @@ class SceneModel:
                 self.xyz - keyframe.approx_centre[None], dim=-1
             )
             screen_size = self.f * self.scaling.max(dim=-1)[0] / dist
-            valid_gs_mask *= screen_size < 0.5 * self.width
+            valid_gs_mask &= screen_size < 0.5 * self.width
+            valid_gs_mask &= gaussian_aspect_ratio_mask(
+                self.gaussian_params["scaling"]["val"],
+                max_aspect_ratio=getattr(self, "max_gaussian_aspect_ratio", 8.0),
+            )
         else:
             valid_gs_mask = torch.ones(0, device="cuda", dtype=torch.bool)
 
@@ -1073,7 +910,6 @@ class SceneModel:
             "scaling": scales,
             "rotation": rots,
         }
-        extension_tensors = self._coarsen_extension_tensors_for_lod(extension_tensors)
         with self.lock:
             self.optimizer.add_and_prune(extension_tensors, valid_gs_mask)
 
@@ -1209,37 +1045,47 @@ class SceneModel:
                         for name in self.gaussian_params
                     }
                     xyz = small_gaussians["xyz"].contiguous()
+                    small_screen_size = screen_size[small_mask]
+
                     _, nn_idx = distIndex2(xyz, k)
                     nn_idx = nn_idx.view(-1, k)
+                    
+                    M = int(xyz.shape[0] / (k + 1))
                     perm = torch.randperm(xyz.shape[0], device=xyz.device)
-                    idx = perm[: (xyz.shape[0] // (k + 1))]
+                    idx = perm[: M]
                     selected_nn_idx = torch.cat([idx[..., None], nn_idx[idx]], dim=-1)
-
+                    
                     # Compute merging weights based on contribution to the rendering
-                    weights = self.gaussian_params["opacity"]["val"][
-                        selected_nn_idx, 0
-                    ].sigmoid() * (screen_size[selected_nn_idx] ** 2)
-                    weights = weights / weights.sum(dim=-1, keepdim=True)
+                    weights = small_gaussians["opacity"][selected_nn_idx, 0].sigmoid() * (small_screen_size[selected_nn_idx] ** 2)
+                    
+                    # Safe weight normalization to prevent division by zero
+                    weights_sum = weights.sum(dim=-1, keepdim=True)
+                    valid_mask = torch.ones_like(weights, dtype=torch.bool)
+                    weights = torch.where(
+                        weights_sum > 1e-8,
+                        weights / weights_sum,
+                        valid_mask.float() / valid_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                    )
                     weights.unsqueeze_(-1)
 
+                    # Align quaternions to prevent polarity cancellation (q and -q) which sum to [0,0,0,0] and crash CUDA rasterizer
+                    rots = small_gaussians["rotation"][selected_nn_idx, :]
+                    base_rot = rots[:, 0:1, :]
+                    dot_product = (rots * base_rot).sum(dim=-1, keepdim=True)
+                    rots = torch.where(dot_product < 0, -rots, rots)
+                    merged_rots = (rots * weights).sum(dim=1)
+                    merged_rots = torch.nn.functional.normalize(merged_rots, dim=-1)
+
                     # Merge the Gaussians by averaging their parameters
+                    valid_counts = valid_mask.sum(dim=-1, keepdim=True).unsqueeze(-1)
                     merged_gaussians = {
-                        "xyz": (self.gaussian_params["xyz"]['val'][selected_nn_idx, :] * weights).sum(dim=1),
-                        "f_dc": (self.gaussian_params["f_dc"]['val'][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1),
-                        "opacity": inverse_sigmoid(self.gaussian_params["opacity"]['val'][selected_nn_idx, :].sigmoid() * weights).sum(dim=1),
-                        "scaling": torch.log((torch.exp(self.gaussian_params["scaling"]['val'][selected_nn_idx, :]) * weights * (k+1)).sum(dim=1)),
-                        "rotation": (self.gaussian_params["rotation"]['val'][selected_nn_idx, :] * weights).sum(dim=1),
+                        "xyz": (small_gaussians["xyz"][selected_nn_idx, :] * weights).sum(dim=1),
+                        "f_dc": (small_gaussians["f_dc"][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1),
+                        "f_rest": (small_gaussians["f_rest"][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1),
+                        "opacity": inverse_sigmoid((small_gaussians["opacity"][selected_nn_idx, 0].sigmoid() * weights.squeeze(-1)).sum(dim=1).clamp(1e-4, 1-1e-4)).unsqueeze(-1),
+                        "scaling": torch.log((torch.exp(small_gaussians["scaling"][selected_nn_idx, :]) * weights * valid_counts).sum(dim=1).clamp_min(1e-8)),
+                        "rotation": merged_rots,
                     }
-                    if "f_rest" in self.gaussian_params:
-                         merged_gaussians["f_rest"] = (self.gaussian_params["f_rest"]["val"][selected_nn_idx, :] * weights).sum(dim=1)
-                    if "sg_params" in self.gaussian_params:
-                         # sg_params: (N, 1, 7)
-                         # weights: (N, 1, 1) after unsqueeze? No, weights is (M, k, 1)
-                         # selected_nn_idx: (M, k)
-                         # sg_val: (M, k, 1, 7)
-                         # weights needs to Broadcast.
-                         # weights.unsqueeze(-1) -> (M, k, 1, 1)
-                         merged_gaussians["sg_params"] = (self.gaussian_params["sg_params"]["val"][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1)
 
                     # Offload the previous Gaussians to the CPU
                     self.active_anchor.duplicate_param_dict()
@@ -1266,8 +1112,7 @@ class SceneModel:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-    # def save(self path: str, reconstruction_time: float = 0, n_frames: int = 0):
-    def save(self, path: str, reconstruction_time: float = 0, n_frames: int = 0, save_with_lod_suffix: bool = False):
+    def save(self, path: str, reconstruction_time: float = 0, n_frames: int = 0):
         # Get metrics
         metrics = {
             "num anchors": len(self.anchors),
@@ -1287,12 +1132,7 @@ class SceneModel:
         pcd_path = os.path.join(path, "point_clouds")
         os.makedirs(pcd_path, exist_ok=True)
         for index, anchor in enumerate(self.anchors):
-            if save_with_lod_suffix and hasattr(self, 'current_lod'):
-                anchor_name = f"anchor_{index}_lod_{self.current_lod}.ply"
-            else:
-                anchor_name = f"anchor_{index}.ply"
-            anchor.save_ply(os.path.join(pcd_path, anchor_name))
-
+            anchor.save_ply(os.path.join(pcd_path, f"anchor_{index}.ply"))
 
         # Save metadata
         metadata = {
@@ -1352,7 +1192,6 @@ class SceneModel:
             anchor.to("cuda", with_keyframes=True)
             self.gaussian_params = anchor.gaussian_params
             self.anchor_weights[anchor_id] = 1
-            # self.active_frames_gpu = anchor.keyframe_ids
             self.reset_optimizer()
 
             # # Ensure other anchors are on cpu to save memory
@@ -1366,7 +1205,3 @@ class SceneModel:
             # Update the anchor and store it on cpu
             anchor.gaussian_params = self.gaussian_params
             self.anchor_weights[anchor_id] = 0
-
-            # Offload to CPU to free GPU memory
-            anchor.to("cpu", with_keyframes=True)
-            torch.cuda.empty_cache()

@@ -55,7 +55,8 @@ if __name__ == "__main__":
     print("Initializing modules and running just in time compilation, may take a while...")
     max_error = max(args.match_max_error * width, 1.5)
     min_displacement = max(args.min_displacement * width, 30)
-    matcher = Matcher(args.fundmat_samples, max_error)
+    matcher = Matcher(args.fundmat_samples, max_error,
+                      sem_weight=args.sem_weight if args.use_semantic_features else 0.0)
     triangulator = Triangulator(
         args.num_kpts, args.num_prev_keyframes_miniba_incr, max_error
     )
@@ -66,7 +67,13 @@ if __name__ == "__main__":
     dense_extractor = DenseExtractor(width, height)
     depth_estimator = MonoDepthEstimator(width, height)
     scene_model = SceneModel(width, height, args, matcher)
-    detector = Detector(args.num_kpts, width, height)
+    # Semantic extractor (optional)
+    semantic_extractor = None
+    if args.use_semantic_features:
+        from poses.semantic_extractor import SemanticExtractor
+        semantic_extractor = SemanticExtractor(width, height, sem_dim=args.sem_feat_dim)
+        print(f"Semantic features enabled (dim={args.sem_feat_dim}, weight={args.sem_weight})")
+    detector = Detector(args.num_kpts, width, height, semantic_extractor=semantic_extractor)
 
     # Initialize the viewer
     if args.viewer_mode in ["server", "local"]:
@@ -326,6 +333,8 @@ if __name__ == "__main__":
     # Save the model and metrics
     print("Saving the reconstruction to:", args.model_path)
     metrics = scene_model.save(args.model_path, reconstruction_time, len(dataset))
+    # Save failure log
+    pose_initializer.save_failure_log(args.model_path)
     print(
         ", ".join(
             f"{metric}: {value:.3f}"

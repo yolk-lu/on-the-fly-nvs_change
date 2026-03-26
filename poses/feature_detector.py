@@ -21,9 +21,10 @@ class DescribedKeypoints():
     A class to store 2D keypoints, their descriptors, their matches to other images, and their estimated 3D positions.
     """
     @torch.no_grad()
-    def __init__(self, kpts, feats):
+    def __init__(self, kpts, feats, sem_feats=None):
         self.kpts = kpts
         self.feats = feats
+        self.sem_feats = sem_feats  # [N, sem_dim] or None
         self.valid = feats.abs().sum(dim=-1) > 0
         self.nvalid = self.valid.sum()
         self.has_pt3d = torch.zeros(kpts.shape[0], dtype=torch.bool, device=kpts.device)
@@ -49,6 +50,8 @@ class DescribedKeypoints():
     def to(self, device):
         self.kpts = self.kpts.to(device)
         self.feats = self.feats.to(device)
+        if self.sem_feats is not None:
+            self.sem_feats = self.sem_feats.to(device)
         self.valid = self.valid.to(device)
         self.has_pt3d = self.has_pt3d.to(device)
         self.pts_conf = self.pts_conf.to(device)
@@ -89,7 +92,10 @@ class InterpolateSparse2d(nn.Module):
     
 class Detector():
     @torch.no_grad()
-    def __init__(self, top_k, width, height):
+    def __init__(self, top_k, width, height, semantic_extractor=None):
+        self.semantic_extractor = semantic_extractor
+        self.width = width
+        self.height = height
         cache_path = f"models/cache/xfeat_{width}_{height}_{top_k}.pt"
         dummy_img = torch.randn(1, 3, height, width).cuda().to(torch.half)
         if os.path.exists(cache_path):
@@ -180,5 +186,9 @@ class Detector():
 
     @torch.no_grad()
     def __call__(self, image):
-        return DescribedKeypoints(*(self.extractor(image[None].half())))
+        kpts, feats = self.extractor(image[None].half())
+        sem_feats = None
+        if self.semantic_extractor is not None:
+            sem_feats = self.semantic_extractor.extract(image, kpts)
+        return DescribedKeypoints(kpts, feats, sem_feats=sem_feats)
     

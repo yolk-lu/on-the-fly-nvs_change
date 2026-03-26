@@ -74,7 +74,7 @@ def get_args():
                         help="Maximum reprojection error for matching keypoints, proportion of the image width. This is used to filter outliers and discard points at triangulation.")
     parser.add_argument('--fundmat_samples', type=int, default=2000,
                         help="Maximum number of set of matches used to estimate the fundamental matrix for outlier removal")
-    parser.add_argument('--min_num_inliers', type=int, default=50, #100
+    parser.add_argument('--min_num_inliers', type=int, default=25, #50 #100
                         help="The keyframe will be added only if the number of inliers is greater than this value")
     # Initial mini bundle adjustment
     parser.add_argument('--num_keyframes_miniba_bootstrap', type=int, default=8,
@@ -93,13 +93,29 @@ def get_args():
     # Incremental pose optimization
     parser.add_argument('--num_prev_keyframes_miniba_incr', type=int, default=6,
                         help="Number of previous keyframes for incremental pose initialization")
-    parser.add_argument('--num_prev_keyframes_check', type=int, default=15, #20
+    parser.add_argument('--num_prev_keyframes_check', type=int, default=20, #20
                         help="Number of previous keyframes to check for matches with new keyframe")
     parser.add_argument('--pnpransac_samples', type=int, default=2000,
                         help="Maximum number of set of 2D-3D matches used to estimate the initial pose and outlier removal")
     parser.add_argument('--num_pts_miniba_incr', type=int, default=2000,
                         help="Number of keypoints considered for initial mini bundle adjustment")
     parser.add_argument('--iters_miniba_incr', type=int, default=20)
+
+    # Semantic feature matching
+    parser.add_argument('--use_semantic_features', action='store_true',
+                        help="Enable DINOv2 semantic features for matching")
+    parser.add_argument('--semantic_backbone', type=str, default='dinov2',
+                        choices=['dinov2', 'dinov3'],
+                        help="Backbone for semantic feature extraction")
+    parser.add_argument('--sem_feat_dim', type=int, default=128,
+                        help="Dimensionality of semantic features after PCA")
+    parser.add_argument('--sem_weight', type=float, default=0.3,
+                        help="Weight of semantic similarity in matching score (0-1)")
+    # Camera track extrapolation
+    parser.add_argument('--use_track_extrapolation', action='store_true',
+                        help="Use camera trajectory extrapolation for PnP initial pose")
+    parser.add_argument('--track_extrapolation_window', type=int, default=3,
+                        help="Number of recent keyframes for pose extrapolation")
 
     ## Gaussian initialization options
     parser.add_argument('--init_proba_scaler', type=float, default=2,
@@ -112,6 +128,8 @@ def get_args():
     ## Level of Detail (LoD) options
     parser.add_argument('--lod_min', type=int, default=1, help="Minimum level of detail")
     parser.add_argument('--lod_max', type=int, default=1, help="Maximum level of detail")
+    parser.add_argument('--lod_reference_max', type=int, default=3,
+                        help="Reference max LoD used to scale LoD effects when training fixed single-level runs")
     parser.add_argument('--lod1_scaling_lower_bound', type=float, default=0.001, 
                         help="Lower bound for scaling at LoD 1")
     parser.add_argument('--lod_scaling_ratio', type=float, default=2.0, 
@@ -126,6 +144,16 @@ def get_args():
                         help="Minimum number of newly spawned Gaussians before applying LoD merge")
     parser.add_argument('--lod_blur_scale_boost', type=float, default=0.25,
                         help="Additional scale boost applied after merging at low LoD to increase blur")
+    parser.add_argument('--boundary_penalty_weight', type=float, default=0.35,
+                        help="Additional spawn penalty near image borders in add_new_gaussians")
+    parser.add_argument('--boundary_penalty_margin_ratio', type=float, default=0.08,
+                        help="Border width ratio used for boundary spawn penalty (0~0.5)")
+    parser.add_argument('--distance_penalty_weight', type=float, default=0.20,
+                        help="Additional spawn penalty for farther rendered depth regions")
+    parser.add_argument('--max_gaussian_aspect_ratio', type=float, default=8.0,
+                        help="Prune Gaussians whose max/min scale ratio exceeds this threshold")
+    parser.add_argument('--save_test_depth', type=int, default=1,
+                        help="If 1, save depth visualizations and npy arrays for test frames")
     parser.add_argument('--lod_min_pose_stability', type=float, default=0.55,
                         help="Minimum pose stability score required before increasing LoD")
     parser.add_argument('--lod_max_projection_error_px', type=float, default=3.0,

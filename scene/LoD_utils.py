@@ -28,6 +28,97 @@ def _extract_scaling(gaussians):
     raise ValueError("Unable to extract scaling from gaussians input")
 
 
+def _extract_rotation(gaussians):
+    if isinstance(gaussians, dict):
+        if "rotation" in gaussians and isinstance(gaussians["rotation"], dict):
+            return gaussians["rotation"]["val"]
+        if "rotation" in gaussians:
+            return gaussians["rotation"]
+    if hasattr(gaussians, "gaussian_params") and "rotation" in gaussians.gaussian_params:
+        return gaussians.gaussian_params["rotation"]["val"]
+    if hasattr(gaussians, "rotation"):
+        return gaussians.rotation
+    return None
+
+
+def _quaternion_to_rotation_matrix(q):
+    q = q / torch.linalg.norm(q, dim=-1, keepdim=True).clamp(min=1e-8)
+    w, x, y, z = q.unbind(dim=-1)
+
+    ww = w * w
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    wx = w * x
+    wy = w * y
+    wz = w * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+
+    row0 = torch.stack([ww + xx - yy - zz, 2 * (xy - wz), 2 * (xz + wy)], dim=-1)
+    row1 = torch.stack([2 * (xy + wz), ww - xx + yy - zz, 2 * (yz - wx)], dim=-1)
+    row2 = torch.stack([2 * (xz - wy), 2 * (yz + wx), ww - xx - yy + zz], dim=-1)
+    return torch.stack([row0, row1, row2], dim=-2)
+
+
+def projected_major_axis_px(
+    gaussians,
+    view_matrix,
+    focal,
+    image_width,
+    image_height,
+    scaling_lower_bound: float = 0.0,
+):
+    """
+    View-dependent projected major-axis length (px) per Gaussian.
+
+    Uses the covariance projection form:
+      Sigma_img = J(v) W(v) Sigma W(v)^T J(v)^T
+    and returns sqrt(lambda_max(Sigma_img)).
+    """
+    xyz = _extract_xyz(gaussians)
+    scale = get_scale(gaussians, scaling_lower_bound=scaling_lower_bound)
+    rot_q = _extract_rotation(gaussians)
+
+    Rcw = view_matrix[:3, :3].to(xyz.device)
+    tcw = view_matrix[:3, 3].to(xyz.device)
+    xyz_cam = (Rcw @ xyz.T).T + tcw[None]
+    z = xyz_cam[:, 2].clamp(min=1e-6)
+
+    focal_px = float(focal)
+    if focal_px <= 0:
+        focal_px = 0.5 * (image_width + image_height)
+    fx = torch.full_like(z, focal_px)
+    fy = torch.full_like(z, focal_px)
+
+    if rot_q is None:
+        radius = scale.max(dim=-1).values
+        err_px = focal_px * radius / z
+        return torch.nan_to_num(err_px, nan=0.0, posinf=1e6, neginf=0.0)
+
+    Robj = _quaternion_to_rotation_matrix(rot_q.to(xyz.device))
+    D = torch.diag_embed(scale.square())
+    sigma_world = Robj @ D @ Robj.transpose(-1, -2)
+
+    Rcw_expand = Rcw[None].expand(sigma_world.shape[0], -1, -1)
+    sigma_cam = Rcw_expand @ sigma_world @ Rcw_expand.transpose(-1, -2)
+
+    x = xyz_cam[:, 0]
+    y = xyz_cam[:, 1]
+    J = torch.zeros((xyz_cam.shape[0], 2, 3), device=xyz.device, dtype=xyz.dtype)
+    J[:, 0, 0] = fx / z
+    J[:, 0, 2] = -fx * x / (z * z)
+    J[:, 1, 1] = fy / z
+    J[:, 1, 2] = -fy * y / (z * z)
+
+    sigma_img = J @ sigma_cam @ J.transpose(-1, -2)
+    sigma_img = 0.5 * (sigma_img + sigma_img.transpose(-1, -2))
+    eigvals = torch.linalg.eigvalsh(sigma_img)
+    major_axis = torch.sqrt(torch.clamp(eigvals[:, -1], min=0.0) + 1e-8)
+    return torch.nan_to_num(major_axis, nan=0.0, posinf=1e6, neginf=0.0)
+
+
 def get_gaussians_distance(gaussians, camera_position):
     xyz = _extract_xyz(gaussians)
     if camera_position.dim() == 1:
@@ -78,6 +169,60 @@ def level_of_gaussians(
         prev = prev & (~mask)
     levels[num_levels - 1] = torch.where(prev)[0]
     return levels
+
+
+def distance_level_colors(
+    gaussians,
+    camera_position,
+    num_levels: int = 4,
+    palette: torch.Tensor | None = None,
+):
+    """
+    Assign each gaussian a distance-based LoD level and RGB debug color.
+
+    Returns:
+      level_ids: LongTensor [N]
+      colors: FloatTensor [N,3] in [0,1]
+    """
+    xyz = _extract_xyz(gaussians)
+    n = xyz.shape[0]
+    if n == 0:
+        return (
+            torch.empty(0, dtype=torch.long, device=xyz.device),
+            torch.empty(0, 3, dtype=xyz.dtype, device=xyz.device),
+        )
+
+    groups = level_of_gaussians(gaussians, camera_position, num_levels=num_levels)
+    level_ids = torch.zeros(n, dtype=torch.long, device=xyz.device)
+    for lvl, idx in groups.items():
+        level_ids[idx] = int(lvl)
+
+    if palette is None:
+        palette = torch.tensor(
+            [
+                [1.0, 0.1, 0.1],
+                [1.0, 0.6, 0.1],
+                [1.0, 1.0, 0.1],
+                [0.1, 1.0, 0.1],
+                [0.1, 1.0, 1.0],
+                [0.1, 0.4, 1.0],
+                [0.8, 0.1, 1.0],
+            ],
+            dtype=xyz.dtype,
+            device=xyz.device,
+        )
+    else:
+        palette = palette.to(device=xyz.device, dtype=xyz.dtype)
+
+    if num_levels <= palette.shape[0]:
+        level_palette = palette[:num_levels]
+    else:
+        sample_ids = torch.linspace(0, palette.shape[0] - 1, steps=num_levels, device=xyz.device)
+        sample_ids = torch.round(sample_ids).long().clamp(0, palette.shape[0] - 1)
+        level_palette = palette[sample_ids]
+
+    colors = level_palette[level_ids]
+    return level_ids, colors
 
 
 def progressive_merging_gaussians(
@@ -148,26 +293,89 @@ def projection_screen_error(
     """
     Approximate projection error in pixels from Gaussian screen footprint.
     """
-    xyz = _extract_xyz(gaussians)
-    radius = get_gaussians_radius(gaussians, scaling_lower_bound=scaling_lower_bound)
-
-    R = view_matrix[:3, :3]
-    t = view_matrix[:3, 3]
-    xyz_cam = (R @ xyz.T).T + t[None]
-    z = xyz_cam[:, 2].clamp(min=1e-6)
-
-    focal_px = float(focal)
-    if focal_px <= 0:
-        focal_px = 0.5 * (image_width + image_height)
-
-    err_px = focal_px * radius / z
-    err_px = torch.nan_to_num(err_px, nan=0.0, posinf=1e6, neginf=0.0)
+    err_px = projected_major_axis_px(
+        gaussians,
+        view_matrix,
+        focal,
+        image_width,
+        image_height,
+        scaling_lower_bound=scaling_lower_bound,
+    )
     return {
         "mean": err_px.mean().item() if err_px.numel() > 0 else 0.0,
         "median": err_px.median().item() if err_px.numel() > 0 else 0.0,
         "p90": torch.quantile(err_px, 0.90).item() if err_px.numel() > 0 else 0.0,
         "max": err_px.max().item() if err_px.numel() > 0 else 0.0,
     }
+
+
+def distance_boundary_penalty(
+    base_penalty: torch.Tensor,
+    uv_grid: torch.Tensor,
+    width: int,
+    height: int,
+    rendered_depth: torch.Tensor | None = None,
+    boundary_weight: float = 0.35,
+    distance_weight: float = 0.20,
+    boundary_margin_ratio: float = 0.08,
+):
+    """
+    Build a spatial penalty map that mixes:
+    - boundary penalty near image borders
+    - depth-distance penalty (farther pixels penalized more)
+
+    Returns a tensor with the same shape as base_penalty.
+    """
+    penalty = base_penalty
+    device = penalty.device
+    dtype = penalty.dtype
+
+    if boundary_weight > 0:
+        margin_ratio = float(max(0.0, min(0.5, boundary_margin_ratio)))
+        margin_px = int(min(width, height) * margin_ratio)
+        if margin_px > 0:
+            x = uv_grid[..., 0]
+            y = uv_grid[..., 1]
+            dist_x = torch.minimum(x, (width - 1) - x)
+            dist_y = torch.minimum(y, (height - 1) - y)
+            dist_to_edge = torch.minimum(dist_x, dist_y)
+            border_map = ((margin_px - dist_to_edge).clamp(min=0.0) / float(margin_px)).clamp(0.0, 1.0)
+            penalty = penalty + float(boundary_weight) * border_map.to(device=device, dtype=dtype)
+
+    if rendered_depth is not None and distance_weight > 0:
+        depth = rendered_depth.to(device=device, dtype=dtype)
+        valid = torch.isfinite(depth) & (depth > 0)
+        if valid.any():
+            d_valid = depth[valid]
+            d_lo = torch.quantile(d_valid, 0.05)
+            d_hi = torch.quantile(d_valid, 0.95)
+            if (d_hi - d_lo).abs() < 1e-8:
+                depth_norm = torch.zeros_like(depth)
+            else:
+                depth_norm = ((depth - d_lo) / (d_hi - d_lo)).clamp(0.0, 1.0)
+            depth_norm = torch.where(valid, depth_norm, torch.zeros_like(depth_norm))
+            penalty = penalty + float(distance_weight) * depth_norm
+
+    return penalty
+
+
+def gaussian_aspect_ratio_mask(
+    log_scaling: torch.Tensor,
+    max_aspect_ratio: float,
+    scaling_lower_bound: float = 0.0,
+):
+    """
+    Keep gaussians whose anisotropy is below threshold:
+      aspect_ratio = max(scale_xyz) / min(scale_xyz)
+    """
+    if max_aspect_ratio <= 1.0:
+        return torch.ones(log_scaling.shape[0], dtype=torch.bool, device=log_scaling.device)
+
+    scales = torch.exp(log_scaling) + float(scaling_lower_bound)
+    min_scale = scales.min(dim=-1).values.clamp_min(1e-8)
+    max_scale = scales.max(dim=-1).values
+    ratio = max_scale / min_scale
+    return ratio <= float(max_aspect_ratio)
 
 
 def pose_stability_score(keyframes, window: int = 8):
@@ -232,3 +440,50 @@ def lod_progressive_ready(
         "projection_error_p90": proj["p90"],
         "reason": reason,
     }
+def get_lod_density(
+    depth_map: torch.Tensor,
+    near_dist: float = 2.0,
+    far_dist: float = 15.0,
+    far_density_ratio: float = 0.2,
+):
+    """
+    Returns (density_multiplier) masks based on depth.
+    Near distances return 1.0. Far distances return far_density_ratio.
+    """
+    t = ((depth_map - near_dist) / max(1e-5, far_dist - near_dist)).clamp(0.0, 1.0)
+    t = t * t * (3.0 - 2.0 * t)
+    
+    density_multiplier = 1.0 - t * (1.0 - far_density_ratio)
+    
+    return density_multiplier
+def get_lod_merge_k(
+    distances: torch.Tensor,
+    near_dist: float = 5.0,
+    far_dist: float = 15.0,
+    k_near: int = 3,
+    k_far: int = 7,
+):
+    """
+    Returns an aggressive merge factor K based on distance to camera.
+    """
+    t = ((distances - near_dist) / max(1e-5, far_dist - near_dist)).clamp(0.0, 1.0)
+    k_float = k_near + t * (k_far - k_near)
+    return k_float.round().long()
+
+def aspect_ratio_penalty(
+    log_scaling: torch.Tensor,
+    max_aspect_ratio: float = 8.0,
+    scaling_lower_bound: float = 0.0,
+):
+    """
+    L1 penalty on the ratio of max_scale / min_scale if it exceeds max_aspect_ratio.
+    Operating directly in log-space guarantees gradients are precisely +/- 1, 
+    completely preventing float32 Adam overflows from exp() operations.
+    """
+    import math
+    max_log = log_scaling.max(dim=-1).values
+    min_log = log_scaling.min(dim=-1).values
+    max_diff = math.log(float(max_aspect_ratio))
+    
+    penalty = torch.nn.functional.relu(max_log - min_log - max_diff)
+    return penalty.mean()
