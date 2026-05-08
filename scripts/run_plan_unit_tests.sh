@@ -49,21 +49,22 @@ PYTEST_TARGETS=(
   tests/test_anchor_local_map.py
   tests/test_render_guard.py
   tests/test_gaussian_optimizer.py
-  tests/test_pipeline_smoke.py
-  tests/test_parallax_pose_initializer.py
-  tests/test_anchor_graph.py
 )
 
 {
   echo
-  echo "[Step 1/2] py_compile"
+  echo "[Step 1/3] py_compile"
   "${PYTHON_BIN}" -m py_compile "${COMPILE_TARGETS[@]}"
 
   echo
-  echo "[Step 2/2] pytest"
+  echo "[Step 2/3] pytest"
   "${PYTHON_BIN}" -m pytest "${PYTEST_TARGETS[@]}" -q
+
+  echo
+  echo "[Step 3/3] module smoke"
+  "${PYTHON_BIN}" -m pipeline.module_smoke_runner
+  "${PYTHON_BIN}" -m pipeline.anchor_local_train --smoke-only
 
   echo
   echo "[UnitTest] PASS"
 } 2>&1 | tee -a "${LOG_FILE}"
-
