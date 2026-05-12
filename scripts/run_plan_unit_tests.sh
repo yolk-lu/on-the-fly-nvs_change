@@ -16,6 +16,7 @@ echo "[UnitTest] log=${LOG_FILE}" | tee -a "${LOG_FILE}"
 
 COMPILE_TARGETS=(
   pipeline/frame_state.py
+  pipeline/concurrency.py
   pipeline/observation_builder.py
   pipeline/gaussian_spawn_policy.py
   pipeline/reconstruction_controller.py
@@ -31,6 +32,9 @@ COMPILE_TARGETS=(
   scene/tsdf_losses.py
   scene/render_guard.py
   scene/gaussian_optimizer.py
+  scene/scale_alignment.py
+  scene/opacity_reset.py
+  scene/loop_verifier.py
   scene/anchor_graph.py
   scene/anchor_chunk_manager.py
   scene/anchor_local_map.py
@@ -40,6 +44,10 @@ COMPILE_TARGETS=(
   tests/test_anchor_local_map.py
   tests/test_render_guard.py
   tests/test_gaussian_optimizer.py
+  tests/test_controller_async.py
+  tests/test_scale_alignment.py
+  tests/test_opacity_reset.py
+  tests/test_loop_verifier.py
 )
 
 PYTEST_TARGETS=(
@@ -49,6 +57,10 @@ PYTEST_TARGETS=(
   tests/test_anchor_local_map.py
   tests/test_render_guard.py
   tests/test_gaussian_optimizer.py
+  tests/test_controller_async.py
+  tests/test_scale_alignment.py
+  tests/test_opacity_reset.py
+  tests/test_loop_verifier.py
 )
 
 {
