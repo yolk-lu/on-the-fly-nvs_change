@@ -3,8 +3,8 @@ import json
 from Progressive_train import ProgressiveRunConfig, _collect_output_status, _parse_progressive_args, _write_manifest
 
 
-def test_progressive_args_are_stripped_before_delegated_trainer():
-    cfg, trainer_argv = _parse_progressive_args(
+def test_progressive_args_are_stripped_before_training_parser():
+    cfg, clean_argv = _parse_progressive_args(
         [
             "Progressive_train.py",
             "--progressive_overlap_mode",
@@ -18,15 +18,14 @@ def test_progressive_args_are_stripped_before_delegated_trainer():
         ]
     )
     assert cfg.overlap_mode == "reserved"
-    assert "--progressive_overlap_mode" not in trainer_argv
-    assert trainer_argv == ["Progressive_train.py", "-s", "/data/scene", "-m", "/tmp/out", "--num_iterations", "1"]
+    assert "--progressive_overlap_mode" not in clean_argv
+    assert clean_argv == ["Progressive_train.py", "-s", "/data/scene", "-m", "/tmp/out", "--num_iterations", "1"]
 
 
 def test_progressive_manifest_records_reserved_overlap(tmp_path):
     cfg = ProgressiveRunConfig(
-        delegated_trainer="train_lod.py",
         overlap_mode="reserved",
-        backend_mode="legacy_scene_model",
+        backend_mode="progressive_scene_model",
         manifest_name="manifest.json",
         run_label="test",
     )
@@ -44,7 +43,8 @@ def test_progressive_manifest_records_reserved_overlap(tmp_path):
     payload = json.loads((tmp_path / "manifest.json").read_text())
     assert payload["status"] == "completed"
     assert payload["progressive"]["overlap_optimization"] == "reserved_not_implemented"
-    assert payload["progressive"]["backend_mode"] == "legacy_scene_model"
+    assert payload["progressive"]["backend_mode"] == "progressive_scene_model"
+    assert payload["progressive"]["trainer_entrypoint"] == "Progressive_train.py"
     assert payload["outputs"]["complete"]
 
 

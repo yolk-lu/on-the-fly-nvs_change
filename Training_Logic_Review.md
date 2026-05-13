@@ -491,7 +491,7 @@ The overlap stage should produce loss log fields such as:
 
 ## 7. Immediate Implementation Order
 
-1. Create `Progressive_train.py` phase-1 entry that delegates to the complete legacy training workflow and writes a Progressive manifest.
+1. Create `Progressive_train.py` phase-1 entry that owns the complete training workflow and writes a Progressive manifest.
 2. Create tracking frontend wrapper that reuses detector/matcher/PoseInitializer but outputs `FrameState` and pose result.
 3. Create mapping callback:
    - TSDF fusion
