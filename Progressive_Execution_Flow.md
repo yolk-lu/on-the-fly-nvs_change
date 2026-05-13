@@ -26,6 +26,7 @@ Input image stream
        - fuse depth into anchor-local TSDF
        - render guarded active window
        - optimize local Gaussian + pose/depth/exposure states
+       - optimize anchor overlap regions
        - localized opacity reset
        - anchor rollover if needed
   -> Global map layer
@@ -111,11 +112,19 @@ Backend step for each keyframe:
    - TSDF surface loss
    - TSDF normal alignment loss
    - Gaussian anisotropy regularization
-6. Apply localized opacity reset:
+6. Optimize overlap regions when the active anchor has neighbor anchors:
+   - sample frames that observe both anchors
+   - render active and neighbor anchors in the overlap field of view
+   - enforce color / depth / TSDF consistency across the shared boundary
+   - restrict gradients to the active anchor and explicitly selected neighbor overlap Gaussians
+   - do not load or optimize the full global map
+7. Apply localized opacity reset:
    - no global opacity reset
    - only visible, low-view-diversity, high-gradient, TSDF-unstable Gaussians can be reset
 
 The backend must never mutate an anchor pose or covariance without taking the anchor write lock.
+
+Overlap optimization is mandatory for wide-area scenes. General per-anchor training can make each local map look correct alone, but it does not guarantee continuity at anchor boundaries. The overlap stage is where Progressive differs from ordinary local training.
 
 ## 4. Anchor Lifecycle
 
@@ -162,6 +171,47 @@ Memory rule:
 
 - GPU should hold only the active anchor and a small neighbor set.
 - Inactive anchors are moved to CPU and represented globally by pose, bounds, graph node, and metadata.
+- Neighbor anchors needed for overlap optimization may be temporarily loaded, optimized only on overlap-selected Gaussians, then offloaded again.
+
+## 4.1 Overlap Optimization
+
+Overlap optimization handles visual and geometric continuity between adjacent anchors.
+
+Trigger conditions:
+
+- new anchor is created from an old active anchor
+- active camera observes an existing neighbor anchor
+- loop closure candidate is accepted and creates a new graph edge
+- render/eval detects a boundary discontinuity near an anchor transition
+
+Inputs:
+
+- active anchor
+- one or more neighbor anchors
+- overlapping keyframes or current frame with co-visibility
+- active and neighbor TSDF queries
+- render packages from the same camera pose
+
+Loss terms:
+
+- overlap photometric consistency: rendered RGB from active/neighbor anchors should agree in shared visible pixels
+- overlap depth consistency: rendered inverse depth should be continuous across the boundary
+- overlap TSDF consistency: local TSDF zero-crossing should not jump after world-to-anchor transforms
+- scale consistency: use grid-based mono-depth scale alignment when the overlap comes from a new anchor rollover
+
+Gradient boundary:
+
+- optimize the active anchor normally
+- optimize neighbor anchor only for Gaussians selected by overlap visibility
+- never optimize all historical anchors at once
+- never let overlap optimization bypass `RenderGuard`
+
+Success signal:
+
+- overlap RGB/depth residual decreases or stays finite
+- no non-finite Gaussian parameters
+- no new renderer CUDA error
+- anchor boundary render does not show a visible discontinuity in the overlap view set
 
 ## 5. Global Graph And Loop Closure
 
@@ -249,6 +299,7 @@ Full Progressive training is not complete until `Progressive_train.py` provides:
 - Async mapping backend callback
 - anchor-local differentiable render adapter
 - active-window local training loop
+- overlap-region optimizer for adjacent anchors
 - save/load format for anchor-local maps, TSDF, AnchorGraph, and keyframes
 - render/eval bridge
 - failure log and resource stats
@@ -258,6 +309,7 @@ Completion condition:
 - Aerial / wide-area ordered image sequence runs to completion.
 - Reconstruction is saved in the new format.
 - Render/eval can load the saved reconstruction.
+- Adjacent anchor overlap regions render continuously without visible seams.
 - No renderer CUDA illegal memory access.
 - If reconstruction fails, failure reason is written explicitly.
 

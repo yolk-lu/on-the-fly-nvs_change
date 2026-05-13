@@ -225,6 +225,7 @@ Progressive 對應：
 - 需要新 save format：anchors、local gaussians、TSDF、AnchorGraph、frame metadata。
 - 需要 render/eval bridge。
 - Fine-tune 不能載入全域 Gaussian；應逐 anchor 或 active-neighborhood 執行。
+- Progressive 的 training 不是只有一般 per-anchor 訓練；還必須加入 overlap 區域優化，否則廣域場景在 anchor 邊界會出現不連續。
 
 ## 3. train_lod.py Additional Logic
 
@@ -355,6 +356,7 @@ Progressive 對應：
   - local pose stability
   - TSDF consistency
   - render projection stability
+  - overlap RGB/depth continuity
   - loop edge confidence
 - LoD increase 不應全域一次套用所有 Gaussian。
 
@@ -402,6 +404,7 @@ Important: both files still rely on `SceneModel` as the central training object.
 | `render()` / `render_from_id()` | anchor-local render adapter with `RenderGuard` |
 | `add_new_gaussians()` | mapping backend Gaussian spawn policy |
 | `optimization_step()` / `optimization_loop()` | active-window local optimizer |
+| cross-anchor continuity from shared frames | overlap-region optimizer |
 | `place_anchor_if_needed()` | controller anchor rollover + scale alignment |
 | `finetune_epoch()` | per-anchor or active-neighborhood finetune |
 | `save()` / `from_scene()` | new anchor-local save/load format + compatibility bridge |
@@ -443,8 +446,48 @@ Key difference from `train.py` / `train_lod.py`:
 - Mapping must not mutate anchor pose without write lock.
 - Global graph must not backpropagate through all Gaussians.
 - Anchor rollover must include scale alignment.
+- Training must include overlap-region optimization for adjacent anchors, not only independent local-anchor optimization.
 - Opacity reset must be localized.
 - TSDF must remain sparse / spatial-hash backed.
+
+## 6.1 Overlap Optimization Requirement
+
+Progressive training targets wide-area reconstruction. For this use case, independent local-anchor training is insufficient because each anchor can converge to a locally valid geometry/color solution while still producing visible seams at anchor boundaries.
+
+Overlap optimization is a separate training stage after local active-window optimization:
+
+```text
+for accepted keyframe or anchor rollover:
+  optimize active anchor local losses
+  find neighbor anchors with co-visibility / graph adjacency
+  sample overlap frames
+  render active + neighbor anchor views
+  optimize overlap-selected Gaussians for continuity
+  record overlap residuals in loss log
+```
+
+Expected overlap losses:
+
+- RGB consistency between anchors on shared pixels.
+- Depth / inverse-depth continuity in shared views.
+- TSDF surface consistency after transforming world points into each anchor-local frame.
+- Scale consistency from grid-based monocular depth alignment when a new anchor is created.
+
+Optimization boundary:
+
+- active anchor can be optimized normally.
+- neighbor anchors are only optimized for overlap-visible Gaussian subsets.
+- historical anchors outside the active-neighborhood are not loaded for gradient updates.
+- full global photometric optimization remains forbidden for memory reasons.
+
+The overlap stage should produce loss log fields such as:
+
+- `overlap_rgb`
+- `overlap_depth`
+- `overlap_tsdf`
+- `overlap_scale`
+- `overlap_num_gaussians`
+- `overlap_neighbor_anchor_id`
 
 ## 7. Immediate Implementation Order
 
@@ -455,9 +498,14 @@ Key difference from `train.py` / `train_lod.py`:
    - Gaussian spawn
    - render guard
    - local optimization placeholder
-4. Create anchor-local render adapter equivalent to `SceneModel.render()`.
-5. Create save/load bridge for anchor-local reconstruction.
-6. Add short-sequence integration test before full dataset run.
+4. Create overlap optimizer:
+   - neighbor anchor selection
+   - overlap frame sampling
+   - overlap RGB/depth/TSDF/scale losses
+   - gradient mask for neighbor overlap Gaussians
+5. Create anchor-local render adapter equivalent to `SceneModel.render()`.
+6. Create save/load bridge for anchor-local reconstruction.
+7. Add short-sequence integration test before full dataset run.
 
 ## 8. Current Risk Points
 
