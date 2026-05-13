@@ -1,6 +1,6 @@
 import json
 
-from Progressive_train import ProgressiveRunConfig, _parse_progressive_args, _write_manifest
+from Progressive_train import ProgressiveRunConfig, _collect_output_status, _parse_progressive_args, _write_manifest
 
 
 def test_progressive_args_are_stripped_before_delegated_trainer():
@@ -30,8 +30,26 @@ def test_progressive_manifest_records_reserved_overlap(tmp_path):
         manifest_name="manifest.json",
         run_label="test",
     )
+    (tmp_path / "metadata.json").write_text("{}")
+    pcd = tmp_path / "point_clouds"
+    pcd.mkdir()
+    (pcd / "anchor_0.ply").write_text("ply\n")
+    colmap = tmp_path / "colmap"
+    colmap.mkdir()
+    (colmap / "cameras.bin").write_bytes(b"")
+    (colmap / "images.bin").write_bytes(b"")
+    (tmp_path / "resource_stats.txt").write_text("")
+    (tmp_path / "lod_1_complete.json").write_text("{}")
     _write_manifest(str(tmp_path), cfg, "completed", started_at=1.0)
     payload = json.loads((tmp_path / "manifest.json").read_text())
     assert payload["status"] == "completed"
     assert payload["progressive"]["overlap_optimization"] == "reserved_not_implemented"
     assert payload["progressive"]["backend_mode"] == "legacy_scene_model"
+    assert payload["outputs"]["complete"]
+
+
+def test_output_status_reports_missing_required_files(tmp_path):
+    status = _collect_output_status(str(tmp_path))
+    assert not status["complete"]
+    assert "metadata_json" in status["missing"]
+    assert "anchor_ply" in status["missing"]

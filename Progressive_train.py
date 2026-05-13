@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import runpy
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 
 @dataclass
@@ -53,13 +54,42 @@ def _parse_progressive_args(argv: list[str]) -> tuple[ProgressiveRunConfig, list
     return cfg, [argv[0], *remaining]
 
 
+def _collect_output_status(model_path: str) -> dict:
+    if not model_path:
+        return {"model_path": "", "complete": False, "missing": ["model_path"]}
+    checks = {
+        "metadata_json": os.path.exists(os.path.join(model_path, "metadata.json")),
+        "point_clouds_dir": os.path.isdir(os.path.join(model_path, "point_clouds")),
+        "anchor_ply": len(glob.glob(os.path.join(model_path, "point_clouds", "anchor_*.ply"))) > 0,
+        "colmap_dir": os.path.isdir(os.path.join(model_path, "colmap")),
+        "colmap_cameras": os.path.exists(os.path.join(model_path, "colmap", "cameras.bin")),
+        "colmap_images": os.path.exists(os.path.join(model_path, "colmap", "images.bin")),
+        "resource_stats": os.path.exists(os.path.join(model_path, "resource_stats.txt")),
+        "loss_records": os.path.exists(os.path.join(model_path, "loss_records.csv")),
+        "loss_curve": os.path.exists(os.path.join(model_path, "loss_curve.png")),
+        "lod_completion_marker": len(glob.glob(os.path.join(model_path, "lod_*_complete.json"))) > 0,
+    }
+    optional = {"loss_records", "loss_curve"}
+    required_missing = [name for name, ok in checks.items() if not ok and name not in optional]
+    return {
+        "model_path": model_path,
+        "checks": checks,
+        "missing": required_missing,
+        "complete": len(required_missing) == 0,
+    }
+
+
 def _write_manifest(model_path: str, cfg: ProgressiveRunConfig, status: str, started_at: float, error: str = "") -> None:
     if not model_path:
         return
     os.makedirs(model_path, exist_ok=True)
+    output_status = _collect_output_status(model_path)
+    manifest_status = status
+    if status == "completed" and not output_status["complete"]:
+        manifest_status = "completed_with_missing_outputs"
     payload = {
         "run_label": cfg.run_label,
-        "status": status,
+        "status": manifest_status,
         "started_at_unix": float(started_at),
         "finished_at_unix": float(time.time()),
         "elapsed_sec": float(time.time() - started_at),
@@ -70,6 +100,7 @@ def _write_manifest(model_path: str, cfg: ProgressiveRunConfig, status: str, sta
             "overlap_optimization": "reserved_not_implemented",
             "completion_gate": "delegated trainer exits successfully and writes reconstruction outputs",
         },
+        "outputs": output_status,
         "error": error,
     }
     with open(os.path.join(model_path, cfg.manifest_name), "w") as f:
