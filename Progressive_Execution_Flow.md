@@ -6,8 +6,9 @@
 
 - `pipeline/reconstruction_controller.py` 已是 Tracking / Mapping / Global Graph 的邊界協調層。
 - `pipeline/anchor_local_train.py --smoke-only` 只作模組 smoke，不是完整訓練入口。
-- `scripts/run_plan_training_full.sh` 預設會阻擋完整訓練，避免把尚未完成的新 pipeline 誤接到舊訓練流程。
-- 正式完整訓練入口預計為 `Progressive_train.py`，目前尚未實作完整 render / train / save / eval loop。
+- `Progressive_train.py` 是正式訓練入口的 phase 1。
+- phase 1 先委派到既有完整訓練 loop，確保工作流能完成；overlap optimization 只保留 hook，不啟用。
+- anchor-local render / optimizer / save-load bridge 仍會逐步替換 phase 1 backend。
 
 ## 高階執行流程
 
@@ -293,7 +294,9 @@ scripts/run_plan_flow.sh
 
 ## 8. Full Training Gate
 
-Full Progressive training is not complete until `Progressive_train.py` provides:
+Full Progressive training phase 1 is complete when `Progressive_train.py` can finish the delegated training workflow and write `progressive_manifest.json`.
+
+Full anchor-local Progressive training is not complete until `Progressive_train.py` provides:
 
 - Tracking frontend loop
 - Async mapping backend callback
@@ -313,4 +316,4 @@ Completion condition:
 - No renderer CUDA illegal memory access.
 - If reconstruction fails, failure reason is written explicitly.
 
-Passing the blocked full-training script or a legacy compatibility baseline is not sufficient for Progressive completion.
+Phase 1 intentionally prioritizes end-to-end train completion. It is not the final anchor-local implementation until the delegated backend is replaced.

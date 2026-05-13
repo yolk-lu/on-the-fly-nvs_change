@@ -22,6 +22,7 @@ COMPILE_TARGETS=(
   pipeline/reconstruction_controller.py
   pipeline/module_smoke_runner.py
   pipeline/anchor_local_train.py
+  Progressive_train.py
   poses/rpc_compensator.py
   poses/parallax_geometry.py
   poses/parallax_mini_ba.py
@@ -48,6 +49,7 @@ COMPILE_TARGETS=(
   tests/test_scale_alignment.py
   tests/test_opacity_reset.py
   tests/test_loop_verifier.py
+  tests/test_progressive_train.py
 )
 
 PYTEST_TARGETS=(
@@ -61,6 +63,7 @@ PYTEST_TARGETS=(
   tests/test_scale_alignment.py
   tests/test_opacity_reset.py
   tests/test_loop_verifier.py
+  tests/test_progressive_train.py
 )
 
 {
