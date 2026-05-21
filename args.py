@@ -70,14 +70,26 @@ def get_args():
     # Matching
     parser.add_argument('--num_kpts', type=int, default=int(4096*1.5),
                         help="Number of keypoints to extract from each image")
+    parser.add_argument('--feature_backend', type=str, default='xfeat',
+                        choices=['xfeat', 'superpoint', 'disk', 'sift', 'aliked'],
+                        help="Local feature extractor backend")
+    parser.add_argument('--matcher_backend', type=str, default='mnn',
+                        choices=['mnn', 'lightglue'],
+                        help="Feature matcher backend")
+    parser.add_argument('--lightglue_filter_threshold', type=float, default=0.1,
+                        help="Match confidence threshold used by LightGlue")
+    parser.add_argument('--lightglue_depth_confidence', type=float, default=0.95,
+                        help="Early-stop confidence threshold for LightGlue depth pruning (-1 to disable)")
+    parser.add_argument('--lightglue_width_confidence', type=float, default=0.99,
+                        help="Point pruning confidence threshold for LightGlue width pruning (-1 to disable)")
     parser.add_argument('--match_max_error', type=float, default=2e-3,
                         help="Maximum reprojection error for matching keypoints, proportion of the image width. This is used to filter outliers and discard points at triangulation.")
-    parser.add_argument('--fundmat_samples', type=int, default=2000,
+    parser.add_argument('--fundmat_samples', type=int, default=1000, # 2000
                         help="Maximum number of set of matches used to estimate the fundamental matrix for outlier removal")
-    parser.add_argument('--min_num_inliers', type=int, default=25, #50 #100
+    parser.add_argument('--min_num_inliers', type=int, default=20, #50 #100
                         help="The keyframe will be added only if the number of inliers is greater than this value")
     # Initial mini bundle adjustment
-    parser.add_argument('--num_keyframes_miniba_bootstrap', type=int, default=8,
+    parser.add_argument('--num_keyframes_miniba_bootstrap', type=int, default=8, # 8
                         help="Number of first keyframes accumulated for pose and focal estimation before optimization")
     parser.add_argument('--num_pts_miniba_bootstrap', type=int, default=2000,
                         help="Number of keypoints considered for initial mini bundle adjustment")
@@ -100,6 +112,14 @@ def get_args():
     parser.add_argument('--num_pts_miniba_incr', type=int, default=2000,
                         help="Number of keypoints considered for initial mini bundle adjustment")
     parser.add_argument('--iters_miniba_incr', type=int, default=20)
+    parser.add_argument('--use_parallax_ba', action='store_true', default=True,
+                        help="Refine triangulated points with parallax-angle parameterization for low-parallax aerial scenes")
+    parser.add_argument('--no_parallax_ba', dest='use_parallax_ba', action='store_false',
+                        help="Disable parallax-angle refinement for triangulated points")
+    parser.add_argument('--parallax_ba_iters', type=int, default=4,
+                        help="Number of batched LM iterations for parallax-angle point refinement")
+    parser.add_argument('--parallax_ref_weight', type=float, default=0.25,
+                        help="Reference-view residual weight in parallax refinement; lower values unlock angular DoF")
 
     # Semantic feature matching
     parser.add_argument('--use_semantic_features', action='store_true',
@@ -116,6 +136,36 @@ def get_args():
                         help="Use camera trajectory extrapolation for PnP initial pose")
     parser.add_argument('--track_extrapolation_window', type=int, default=3,
                         help="Number of recent keyframes for pose extrapolation")
+    parser.add_argument('--use_vggt_pose_prior', action='store_true',
+                        help="Use external VGGT trajectory as pose prior for incremental initialization")
+    parser.add_argument('--vggt_pose_prior_path', type=str, default='',
+                        help="Path to VGGT trajectory prior file (TUM txt or CSV with frame_id,tx,ty,tz,qx,qy,qz,qw)")
+    parser.add_argument('--pose_use_lsf_velocity_gate', action='store_true',
+                        help="Enable LSF-based velocity consistency gate for incremental pose acceptance")
+    parser.add_argument('--no_pose_use_lsf_velocity_gate', dest='pose_use_lsf_velocity_gate', action='store_false',
+                        help="Disable LSF-based velocity consistency gate for incremental pose acceptance")
+    parser.set_defaults(pose_use_lsf_velocity_gate=True)
+    parser.add_argument('--pose_lsf_order', type=int, default=2,
+                        help="Polynomial order N for LSF velocity estimator")
+    parser.add_argument('--pose_lsf_window', type=int, default=8,
+                        help="Window size M for LSF velocity estimator")
+    parser.add_argument('--pose_jump_max_ratio', type=float, default=0.35,
+                        help="Maximum allowed normalized velocity jump ratio for pose acceptance")
+    parser.add_argument('--pose_vel_angle_max_deg', type=float, default=25.0,
+                        help="Maximum allowed angle (deg) between LSF velocity and current pose velocity")
+    parser.add_argument('--pose_retry_max_attempts', type=int, default=3,
+                        help="Maximum retry attempts for pose candidates rejected by LSF velocity gate")
+    parser.add_argument('--pose_retry_queue_size', type=int, default=16,
+                        help="Maximum number of pending pose candidates kept for delayed retry")
+    parser.add_argument('--pose_retry_per_success', type=int, default=1,
+                        help="How many pending pose candidates to retry after each successful registration")
+    parser.add_argument('--pose_lsf_force_accept_after', type=int, default=0,
+                        help="Force-accept a geometrically valid pose after this many consecutive LSF-gate rejections (0 to disable)")
+    parser.add_argument('--pose_retry_rescue_when_full', action='store_true',
+                        help="When retry queue is full and LSF rejects, register the geometry-valid candidate as a bridge keyframe")
+    parser.add_argument('--no_pose_retry_rescue_when_full', dest='pose_retry_rescue_when_full', action='store_false',
+                        help="Disable bridge-keyframe rescue when retry queue is full")
+    parser.set_defaults(pose_retry_rescue_when_full=True)
 
     ## Gaussian initialization options
     parser.add_argument('--init_proba_scaler', type=float, default=2,

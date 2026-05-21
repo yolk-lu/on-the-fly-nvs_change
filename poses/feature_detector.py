@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
+import sys
 
 from poses.matcher import Matches
 
@@ -21,10 +22,11 @@ class DescribedKeypoints():
     A class to store 2D keypoints, their descriptors, their matches to other images, and their estimated 3D positions.
     """
     @torch.no_grad()
-    def __init__(self, kpts, feats, sem_feats=None):
+    def __init__(self, kpts, feats, sem_feats=None, meta=None):
         self.kpts = kpts
         self.feats = feats
         self.sem_feats = sem_feats  # [N, sem_dim] or None
+        self.meta = meta if meta is not None else {}
         self.valid = feats.abs().sum(dim=-1) > 0
         self.nvalid = self.valid.sum()
         self.has_pt3d = torch.zeros(kpts.shape[0], dtype=torch.bool, device=kpts.device)
@@ -57,6 +59,9 @@ class DescribedKeypoints():
         self.pts_conf = self.pts_conf.to(device)
         self.pts3d = self.pts3d.to(device)
         self.depth = self.depth.to(device)
+        for key, value in self.meta.items():
+            if isinstance(value, torch.Tensor):
+                self.meta[key] = value.to(device)
         for key in self.matches:
             self.matches[key].kpts = self.matches[key].kpts.to(device)
             self.matches[key].kpts_other = self.matches[key].kpts_other.to(device)
@@ -92,103 +97,137 @@ class InterpolateSparse2d(nn.Module):
     
 class Detector():
     @torch.no_grad()
-    def __init__(self, top_k, width, height, semantic_extractor=None):
+    def __init__(self, top_k, width, height, semantic_extractor=None, feature_backend="xfeat"):
         self.semantic_extractor = semantic_extractor
         self.width = width
         self.height = height
-        cache_path = f"models/cache/xfeat_{width}_{height}_{top_k}.pt"
-        dummy_img = torch.randn(1, 3, height, width).cuda().to(torch.half)
-        if os.path.exists(cache_path):
-            extractor = torch.jit.load(cache_path)
+        self.feature_backend = feature_backend.lower()
+
+        if self.feature_backend == "xfeat":
+            cache_path = f"models/cache/xfeat_{width}_{height}_{top_k}.pt"
+            dummy_img = torch.randn(1, 3, height, width).cuda().to(torch.half)
+            if os.path.exists(cache_path):
+                extractor = torch.jit.load(cache_path)
+            else:
+                print("Compiling feature extractor")
+                extractor = torch.hub.load('verlab/accelerated_features', 'XFeat', pretrained=True, top_k=top_k)
+                extractor = extractor.cuda().eval().to(torch.half)
+
+                # Overriding the functions to run at fixed size
+                # Adapted from https://github.com/verlab/accelerated_features
+                def preprocess_tensor(x):
+                    H, W = x.shape[-2:]
+                    _H, _W = (H // 32) * 32, (W // 32) * 32
+                    rh, rw = H / _H, W / _W
+
+                    x = F.interpolate(x, (_H, _W), mode='bilinear', align_corners=False)
+                    return x, rh, rw
+
+                # Adapted from https://github.com/verlab/accelerated_features
+                def NMS(x, threshold=0.05, kernel_size=5, nvalid=int(1.5 * top_k)):
+                    B, _, H, W = x.shape
+                    pad = kernel_size // 2
+                    local_max = nn.MaxPool2d(kernel_size=kernel_size, stride=1, padding=pad)(x)
+                    xTot = x * (x == local_max) * (x > threshold)
+                    xOut, pos1d = torch.topk(xTot.view(-1), nvalid)
+                    pos2d = torch.zeros((B, nvalid, 2), dtype=torch.long, device=x.device)
+                    pos2d[..., 0] = pos1d % W
+                    pos2d[..., 1] = pos1d // W
+                    return xOut, pos2d
+
+                # Adapted from https://github.com/verlab/accelerated_features
+                def detectAndCompute(x):
+                    top_k = extractor.top_k
+                    detection_threshold = extractor.detection_threshold
+                    x, rh1, rw1 = extractor.preprocess_tensor(x)
+
+                    B, _, _H1, _W1 = x.shape
+
+                    M1, K1, H1 = extractor.net(x)
+                    M1 = F.normalize(M1, dim=1)
+
+                    # Convert logits to heatmap and extract kpts
+                    K1h = extractor.get_kpts_heatmap(K1)
+                    xOut, mkpts = extractor.NMS(K1h, threshold=detection_threshold, kernel_size=5)
+
+                    # Compute reliability scores
+                    _nearest = InterpolateSparse2d('nearest')
+                    _bilinear = InterpolateSparse2d('bilinear')
+                    scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(H1, mkpts, _H1, _W1)).squeeze(-1)
+                    scores[torch.all(mkpts == 0, dim=-1)] = -1
+
+                    # Select top-k features
+                    idxs = torch.topk(scores, top_k)[1]
+                    mkpts_x = torch.gather(mkpts[..., 0], -1, idxs)
+                    mkpts_y = torch.gather(mkpts[..., 1], -1, idxs)
+                    xOut = torch.gather(xOut[None], -1, idxs)
+                    mkpts = torch.cat([mkpts_x[..., None], mkpts_y[..., None]], dim=-1)
+                    scores = torch.gather(scores, -1, idxs)
+                    scores *= xOut > 0
+
+                    # Interpolate descriptors at kpts positions
+                    feats = extractor.interpolator(M1, mkpts, H=_H1, W=_W1)
+
+                    # L2-Normalize
+                    feats = F.normalize(feats, dim=-1)
+
+                    # Correct kpt scale
+                    mkpts = mkpts.float() * torch.tensor([rw1, rh1], device=mkpts.device, dtype=torch.float).view(1, 1, -1)
+
+                    return mkpts[0], feats[0] * (scores[0][..., None] > 0)
+
+                extractor.preprocess_tensor = preprocess_tensor
+                extractor.NMS = NMS
+                extractor.forward = detectAndCompute
+
+                extractor = torch.jit.trace(extractor, [dummy_img])
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                torch.jit.save(extractor, cache_path)
+                extractor = torch.jit.load(cache_path)
+
+            self.extractor = extractor
         else:
-            print(f"Compiling feature extractor")
-            extractor = torch.hub.load('verlab/accelerated_features', 'XFeat', pretrained=True, top_k=top_k)
-            extractor = extractor.cuda().eval().to(torch.half)
+            lg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "submodules", "LightGlue"))
+            if lg_root not in sys.path:
+                sys.path.insert(0, lg_root)
+            from lightglue import ALIKED, DISK, SIFT, SuperPoint
 
-            ## Overriding the functions to run at fixed size
-            
-            # Adapted from https://github.com/verlab/accelerated_features to enable jit tracing
-            # XFeat: Accelerated Features for Lightweight Image Matching, Under Apache-2.0 license
-            def preprocess_tensor(x):
-                H, W = x.shape[-2:]
-                _H, _W = (H//32) * 32, (W//32) * 32
-                rh, rw = H/_H, W/_W
-
-                x = F.interpolate(x, (_H, _W), mode='bilinear', align_corners=False)
-                return x, rh, rw
-            
-            # Adapted from https://github.com/verlab/accelerated_features to enable jit tracing
-            # XFeat: Accelerated Features for Lightweight Image Matching, Under Apache-2.0 license
-            def NMS(x, threshold = 0.05, kernel_size = 5, nvalid = int(1.5 * top_k)):
-                B, _, H, W = x.shape
-                pad=kernel_size//2
-                local_max = nn.MaxPool2d(kernel_size=kernel_size, stride=1, padding=pad)(x)
-                xTot = x * (x == local_max) * (x > threshold)
-                xOut, pos1d = torch.topk(xTot.view(-1), nvalid)
-                pos2d = torch.zeros((B, nvalid, 2), dtype=torch.long, device=x.device)
-                pos2d[..., 0] = pos1d % W
-                pos2d[..., 1] = pos1d // W
-                return xOut, pos2d
-            
-            # Adapted from https://github.com/verlab/accelerated_features to enable jit tracing
-            # XFeat: Accelerated Features for Lightweight Image Matching, Under Apache-2.0 license
-            def detectAndCompute(x):
-                top_k = extractor.top_k
-                detection_threshold = extractor.detection_threshold
-                x, rh1, rw1 = extractor.preprocess_tensor(x)
-
-                B, _, _H1, _W1 = x.shape
-                
-                M1, K1, H1 = extractor.net(x)
-                M1 = F.normalize(M1, dim=1)
-
-                #Convert logits to heatmap and extract kpts
-                K1h = extractor.get_kpts_heatmap(K1)
-                xOut, mkpts = extractor.NMS(K1h, threshold=detection_threshold, kernel_size=5)
-
-                #Compute reliability scores
-                _nearest = InterpolateSparse2d('nearest')
-                _bilinear = InterpolateSparse2d('bilinear')
-                scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(H1, mkpts, _H1, _W1)).squeeze(-1)
-                scores[torch.all(mkpts == 0, dim=-1)] = -1
-
-                #Select top-k features
-                # idxs = torch.argsort(-scores)
-                idxs = torch.topk(scores, top_k)[1]
-                mkpts_x  = torch.gather(mkpts[...,0], -1, idxs)
-                mkpts_y  = torch.gather(mkpts[...,1], -1, idxs)
-                xOut = torch.gather(xOut[None], -1, idxs)
-                mkpts = torch.cat([mkpts_x[...,None], mkpts_y[...,None]], dim=-1)
-                scores = torch.gather(scores, -1, idxs)
-                scores *= xOut > 0
-
-                #Interpolate descriptors at kpts positions
-                feats = extractor.interpolator(M1, mkpts, H = _H1, W = _W1)
-
-                #L2-Normalize
-                feats = F.normalize(feats, dim=-1)
-
-                #Correct kpt scale
-                mkpts = mkpts.float() * torch.tensor([rw1,rh1], device=mkpts.device, dtype=torch.float).view(1, 1, -1)
-
-                return mkpts[0], feats[0] * (scores[0][..., None] > 0)
-            
-            extractor.preprocess_tensor = preprocess_tensor
-            extractor.NMS = NMS
-            extractor.forward = detectAndCompute
-
-            extractor = torch.jit.trace(extractor, [dummy_img])
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-            torch.jit.save(extractor, cache_path)
-            extractor = torch.jit.load(cache_path)
-
-        self.extractor = extractor
+            extractor_by_name = {
+                "superpoint": SuperPoint,
+                "disk": DISK,
+                "sift": SIFT,
+                "aliked": ALIKED,
+            }
+            if self.feature_backend not in extractor_by_name:
+                raise ValueError(
+                    f"Unsupported feature backend '{self.feature_backend}'. "
+                    "Use one of: xfeat, superpoint, disk, sift, aliked."
+                )
+            extractor_cls = extractor_by_name[self.feature_backend]
+            self.extractor = extractor_cls(max_num_keypoints=top_k).eval().cuda()
 
     @torch.no_grad()
     def __call__(self, image):
-        kpts, feats = self.extractor(image[None].half())
+        if self.feature_backend == "xfeat":
+            kpts, feats = self.extractor(image[None].half())
+            meta = {}
+        else:
+            lg_feats = self.extractor.extract(image[None])
+            kpts = lg_feats["keypoints"][0]
+            feats = lg_feats["descriptors"][0]
+            meta = {}
+            for key in ("image_size", "keypoint_scores", "scales", "oris"):
+                if key in lg_feats:
+                    meta[key] = lg_feats[key][0]
+        kpts = kpts.float()
+        if kpts.numel() > 0:
+            kpts[:, 0].clamp_(0, self.width - 1)
+            kpts[:, 1].clamp_(0, self.height - 1)
+        meta["image_size"] = torch.tensor(
+            [self.width, self.height], device=kpts.device, dtype=torch.float32
+        )
         sem_feats = None
         if self.semantic_extractor is not None:
             sem_feats = self.semantic_extractor.extract(image, kpts)
-        return DescribedKeypoints(kpts, feats, sem_feats=sem_feats)
+        return DescribedKeypoints(kpts, feats, sem_feats=sem_feats, meta=meta)
     

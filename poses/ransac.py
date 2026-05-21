@@ -177,8 +177,21 @@ class RANSACEstimator:
             assert focal is not None
             assert centre is not None
 
+        n_matches = int(mkpts1.shape[0])
+        if n_matches < self.m:
+            # Not enough correspondences for minimal solver; return an all-false mask.
+            if self.type == EstimatorType.P4P:
+                best_model = torch.zeros(3, 4, device=mkpts1.device, dtype=mkpts1.dtype)
+                if R6D_init is not None and t_init is not None:
+                    best_model[:, :3] = sixD2mtx(R6D_init[None])[0]
+                    best_model[:, 3] = t_init
+            else:
+                best_model = torch.eye(3, device=mkpts1.device, dtype=mkpts1.dtype)
+            mask = torch.zeros(n_matches, dtype=torch.bool, device=mkpts1.device)
+            return best_model, mask
+
         # Select N x m random points
-        random_scores = torch.rand(self.N, mkpts1.shape[0], device=mkpts1.device)
+        random_scores = torch.rand(self.N, n_matches, device=mkpts1.device)
         _, idxs = torch.topk(random_scores, self.m, dim=1)
 
         # Run the batch estimator

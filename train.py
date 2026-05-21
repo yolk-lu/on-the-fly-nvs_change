@@ -10,6 +10,9 @@
 #
 
 import os
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import time
 
 import numpy as np
@@ -56,9 +59,19 @@ if __name__ == "__main__":
     max_error = max(args.match_max_error * width, 1.5)
     min_displacement = max(args.min_displacement * width, 30)
     matcher = Matcher(args.fundmat_samples, max_error,
-                      sem_weight=args.sem_weight if args.use_semantic_features else 0.0)
+                      sem_weight=args.sem_weight if args.use_semantic_features else 0.0,
+                      matcher_backend=args.matcher_backend,
+                      feature_backend=args.feature_backend,
+                      lightglue_filter_threshold=args.lightglue_filter_threshold,
+                      lightglue_depth_confidence=args.lightglue_depth_confidence,
+                      lightglue_width_confidence=args.lightglue_width_confidence)
     triangulator = Triangulator(
-        args.num_kpts, args.num_prev_keyframes_miniba_incr, max_error
+        args.num_kpts,
+        args.num_prev_keyframes_miniba_incr,
+        max_error,
+        use_parallax_ba=args.use_parallax_ba,
+        parallax_iters=args.parallax_ba_iters,
+        parallax_ref_weight=args.parallax_ref_weight,
     )
     pose_initializer = PoseInitializer(
         width, height, triangulator, matcher, 2 * max_error, args
@@ -73,7 +86,13 @@ if __name__ == "__main__":
         from poses.semantic_extractor import SemanticExtractor
         semantic_extractor = SemanticExtractor(width, height, sem_dim=args.sem_feat_dim)
         print(f"Semantic features enabled (dim={args.sem_feat_dim}, weight={args.sem_weight})")
-    detector = Detector(args.num_kpts, width, height, semantic_extractor=semantic_extractor)
+    detector = Detector(
+        args.num_kpts,
+        width,
+        height,
+        semantic_extractor=semantic_extractor,
+        feature_backend=args.feature_backend,
+    )
 
     # Initialize the viewer
     if args.viewer_mode in ["server", "local"]:

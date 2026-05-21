@@ -19,6 +19,11 @@ COMPILE_TARGETS=(
   pipeline/concurrency.py
   pipeline/observation_builder.py
   pipeline/gaussian_spawn_policy.py
+  pipeline/keyframe_store.py
+  pipeline/loop_closure_manager.py
+  pipeline/place_recognition.py
+  pipeline/progressive_config.py
+  pipeline/anchor_pose_graph_optimizer.py
   pipeline/reconstruction_controller.py
   pipeline/module_smoke_runner.py
   pipeline/anchor_local_train.py
@@ -32,6 +37,8 @@ COMPILE_TARGETS=(
   scene/tsdf_fusion.py
   scene/tsdf_losses.py
   scene/render_guard.py
+  scene/anchor_local_renderer.py
+  scene/progressive_scene_model.py
   scene/gaussian_optimizer.py
   scene/scale_alignment.py
   scene/opacity_reset.py
@@ -43,12 +50,18 @@ COMPILE_TARGETS=(
   tests/test_parallax_mini_ba.py
   tests/test_adaptive_tsdf.py
   tests/test_anchor_local_map.py
+  tests/test_anchor_pose_graph_optimizer.py
+  tests/test_gaussian_spawn_policy.py
+  tests/test_place_recognition.py
   tests/test_render_guard.py
+  tests/test_anchor_local_renderer.py
   tests/test_gaussian_optimizer.py
   tests/test_controller_async.py
   tests/test_scale_alignment.py
   tests/test_opacity_reset.py
   tests/test_loop_verifier.py
+  tests/test_keyframe_store.py
+  tests/test_loop_closure_manager.py
   tests/test_progressive_train.py
 )
 
@@ -57,12 +70,18 @@ PYTEST_TARGETS=(
   tests/test_parallax_mini_ba.py
   tests/test_adaptive_tsdf.py
   tests/test_anchor_local_map.py
+  tests/test_anchor_pose_graph_optimizer.py
+  tests/test_gaussian_spawn_policy.py
+  tests/test_place_recognition.py
   tests/test_render_guard.py
+  tests/test_anchor_local_renderer.py
   tests/test_gaussian_optimizer.py
   tests/test_controller_async.py
   tests/test_scale_alignment.py
   tests/test_opacity_reset.py
   tests/test_loop_verifier.py
+  tests/test_keyframe_store.py
+  tests/test_loop_closure_manager.py
   tests/test_progressive_train.py
 )
 

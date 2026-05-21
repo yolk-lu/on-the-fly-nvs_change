@@ -66,11 +66,18 @@ class LocalGaussianModel:
         if self.anchor_ids is not None:
             self.anchor_ids = self.anchor_ids[keep_mask].contiguous()
 
-    def world_params(self, R_anchor_to_world: torch.Tensor, t_anchor_to_world: torch.Tensor) -> dict[str, torch.Tensor]:
+    def world_params(
+        self,
+        R_anchor_to_world: torch.Tensor,
+        t_anchor_to_world: torch.Tensor,
+        s_anchor_to_world: torch.Tensor | float = 1.0,
+    ) -> dict[str, torch.Tensor]:
         xyz_local = self.params["xyz"]["val"]
-        xyz_world = (R_anchor_to_world @ xyz_local.T).T + t_anchor_to_world[None]
+        scale = torch.as_tensor(s_anchor_to_world, dtype=xyz_local.dtype, device=xyz_local.device).clamp_min(1e-8)
+        xyz_world = scale * (R_anchor_to_world @ xyz_local.T).T + t_anchor_to_world[None]
         out = {key: self.params[key]["val"] for key in GAUSSIAN_KEYS}
         out["xyz"] = xyz_world.contiguous()
+        out["scaling"] = (self.params["scaling"]["val"] + torch.log(scale)).contiguous()
         out["rotation"] = self.rotate_quaternions_world(self.params["rotation"]["val"], R_anchor_to_world)
         return out
 

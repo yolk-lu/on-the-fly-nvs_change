@@ -106,6 +106,8 @@ class SparseGaussianAdam(BaseAdam):
                 param_dict["lr"].clamp_min_(self.lr_dict[key]["lr_init"] * 0.1)
 
     def add_and_prune(self, extension_tensors, valid_mask):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         for key, param in self.params.items():
             extension_tensor = extension_tensors[key]
             param["val"] = torch.cat(

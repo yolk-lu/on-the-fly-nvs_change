@@ -18,6 +18,9 @@ from poses.feature_detector import DescribedKeypoints
 from poses.triangulator import Triangulator
 from scene.dense_extractor import DenseExtractor
 from scene.mono_depth import MonoDepthEstimator, align_depth
+
+from poses.laplacian_refine import refine_depth_with_laplacian
+
 from scene.optimizers import BaseAdam
 from utils import sample, sixD2mtx, make_torch_sampler, depth2points
 from dataloaders.read_write_model import Camera, BaseImage, rotmat2qvec
@@ -44,7 +47,32 @@ class Keyframe:
         self.image_pyr = [image]
         if not inference_mode: # Only extract depth and feature maps in training mode
             self.feat_map = feat_extractor(image)
-            self.mono_idepth, self.mono_depth_conf = depth_estimator(image)
+            
+            orig_idepth, self.mono_depth_conf = depth_estimator(image)
+            
+            # Execute Phase 10 integration: Laplacian Spatial Geometry Correction
+            # Force Neural Depth boundaries to explicitly snap to RGB object structural borders
+            image_bchw = image.unsqueeze(0)
+            
+            # Sanitize Neural Depth Dimensions back from any [1,1,518,518] format
+            orig_idepth_stripped = orig_idepth.squeeze() # [H_d, W_d]
+            orig_idepth_bchw = orig_idepth_stripped.unsqueeze(0).unsqueeze(0) # [1, 1, H_d, W_d]
+            
+            # Bilinear align if DepthAnythingV2 resized it internally
+            img_h, img_w = image.shape[1], image.shape[2]
+            if orig_idepth_bchw.shape[-2:] != (img_h, img_w):
+                orig_idepth_bchw = F.interpolate(orig_idepth_bchw, size=(img_h, img_w), mode='bilinear', align_corners=False)
+            
+            _, refined_idepth_bchw = refine_depth_with_laplacian(
+                img_tensor=image_bchw, 
+                depth_tensor=orig_idepth_bchw, 
+                iters=50,             # Keep it fast for real-time tracking streams
+                lambda_smooth=5.0
+            )
+            
+            # Retain [1, 1, H, W] batch and channel structure for grid_sample compatibility natively
+            self.mono_idepth = refined_idepth_bchw
+            
             self.width = image.shape[2]
             self.height = image.shape[1]
             self.centre = torch.tensor(
@@ -189,11 +217,23 @@ class Keyframe:
         uv, uvs_others, chosen_kfs_ids = self.triangulator.prepare_matches(
             self.desc_kpts
         )
-        Rts_others = torch.stack(
-            [all_keyframes[index].get_Rt() for i, index in enumerate(chosen_kfs_ids)],
-            dim=0,
-        )
-        if len(Rts_others < self.triangulator.n_cams):
+        id_to_kf = {int(kf.index): kf for kf in all_keyframes}
+        Rts_others_list = []
+        for i, kf_id in enumerate(chosen_kfs_ids):
+            kf_other = id_to_kf.get(int(kf_id), None)
+            if kf_other is None:
+                # Missing keyframe id in the current list: invalidate this match row.
+                uvs_others[i] = -1
+                Rts_others_list.append(torch.eye(4, device="cuda"))
+            else:
+                Rts_others_list.append(kf_other.get_Rt())
+
+        if len(Rts_others_list) > 0:
+            Rts_others = torch.stack(Rts_others_list, dim=0)
+        else:
+            Rts_others = torch.empty(0, 4, 4, device="cuda")
+
+        if len(Rts_others) < self.triangulator.n_cams:
             Rts_others = torch.cat(
                 [
                     Rts_others,

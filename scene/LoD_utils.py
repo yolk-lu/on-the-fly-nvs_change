@@ -42,7 +42,11 @@ def _extract_rotation(gaussians):
 
 
 def _quaternion_to_rotation_matrix(q):
-    q = q / torch.linalg.norm(q, dim=-1, keepdim=True).clamp(min=1e-8)
+    q = torch.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
+    identity = torch.zeros_like(q)
+    identity[..., 0] = 1.0
+    q_norm = torch.linalg.norm(q, dim=-1, keepdim=True)
+    q = torch.where(q_norm > 1e-8, q / q_norm.clamp(min=1e-8), identity)
     w, x, y, z = q.unbind(dim=-1)
 
     ww = w * w
@@ -80,10 +84,16 @@ def projected_major_axis_px(
     xyz = _extract_xyz(gaussians)
     scale = get_scale(gaussians, scaling_lower_bound=scaling_lower_bound)
     rot_q = _extract_rotation(gaussians)
+    if xyz.numel() == 0:
+        return torch.empty(0, device=xyz.device, dtype=xyz.dtype)
+
+    xyz = torch.nan_to_num(xyz, nan=0.0, posinf=1e6, neginf=-1e6)
+    scale = torch.nan_to_num(scale, nan=0.0, posinf=1e6, neginf=0.0).clamp(1e-8, 1e6)
 
     Rcw = view_matrix[:3, :3].to(xyz.device)
     tcw = view_matrix[:3, 3].to(xyz.device)
     xyz_cam = (Rcw @ xyz.T).T + tcw[None]
+    xyz_cam = torch.nan_to_num(xyz_cam, nan=0.0, posinf=1e6, neginf=-1e6)
     z = xyz_cam[:, 2].clamp(min=1e-6)
 
     focal_px = float(focal)
@@ -114,8 +124,15 @@ def projected_major_axis_px(
 
     sigma_img = J @ sigma_cam @ J.transpose(-1, -2)
     sigma_img = 0.5 * (sigma_img + sigma_img.transpose(-1, -2))
-    eigvals = torch.linalg.eigvalsh(sigma_img)
-    major_axis = torch.sqrt(torch.clamp(eigvals[:, -1], min=0.0) + 1e-8)
+    sigma_img = torch.nan_to_num(sigma_img, nan=0.0, posinf=1e12, neginf=-1e12)
+    sigma_img = sigma_img.clamp(-1e12, 1e12)
+    a = sigma_img[:, 0, 0]
+    b = sigma_img[:, 0, 1]
+    c = sigma_img[:, 1, 1]
+    trace_half = 0.5 * (a + c)
+    delta = torch.sqrt((0.5 * (a - c)).square() + b.square()).clamp(max=1e12)
+    lambda_max = trace_half + delta
+    major_axis = torch.sqrt(torch.clamp(lambda_max, min=0.0) + 1e-8)
     return torch.nan_to_num(major_axis, nan=0.0, posinf=1e6, neginf=0.0)
 
 
@@ -128,7 +145,8 @@ def get_gaussians_distance(gaussians, camera_position):
 
 def get_scale(gaussians, scaling_lower_bound: float = 0.0):
     scaling = _extract_scaling(gaussians)
-    return torch.exp(scaling) + float(scaling_lower_bound)
+    scaling = torch.nan_to_num(scaling, nan=-20.0, posinf=20.0, neginf=-20.0)
+    return torch.exp(scaling.clamp(-20.0, 20.0)) + float(scaling_lower_bound)
 
 
 def get_gaussians_radius(gaussians, scaling_lower_bound: float = 0.0):
@@ -487,3 +505,86 @@ def aspect_ratio_penalty(
     
     penalty = torch.nn.functional.relu(max_log - min_log - max_diff)
     return penalty.mean()
+
+
+def screenspace_clamp(
+    scaling: torch.Tensor,
+    xyz: torch.Tensor,
+    cam_centre: torch.Tensor,
+    focal: float,
+    max_screen_px: float = 200.0,
+) -> torch.Tensor:
+    """
+    Returns a NEW log-scaling tensor with oversized Gaussians shrunk so their
+    projected screen footprint does not exceed max_screen_px.
+
+    NEVER mutates the input `scaling` tensor.
+
+    Args:
+        scaling: (N, 3) log-space scaling parameters
+        xyz: (N, 3) Gaussian world positions
+        cam_centre: (3,) camera centre position
+        focal: focal length in pixels
+        max_screen_px: maximum allowed screen-space size in pixels
+    Returns:
+        (N, 3) clamped log-scaling (new tensor)
+    """
+    result = scaling.clone()
+
+    dist = torch.linalg.vector_norm(xyz - cam_centre[None], dim=-1).clamp(min=1e-6)
+    max_scale = torch.exp(scaling).max(dim=-1)[0]  # physical max scale per Gaussian
+    screen_size = focal * max_scale / dist
+
+    # Only modify Gaussians that exceed the threshold
+    over_mask = screen_size > max_screen_px
+    if over_mask.any():
+        shrink_factor = max_screen_px / screen_size[over_mask]
+        # Apply uniform shrink in log-space: log(s * f) = log(s) + log(f)
+        result[over_mask] = result[over_mask] + torch.log(shrink_factor).unsqueeze(-1)
+
+    return result
+
+
+def validate_merged_gaussians(merged: dict) -> dict:
+    """
+    Post-merge validation: fix degenerate quaternions and remove NaN/Inf rows.
+
+    1. Zero-norm quaternions → replaced with identity [1,0,0,0]
+    2. Rows with NaN/Inf in any parameter → removed entirely
+
+    Args:
+        merged: dict with keys "xyz", "f_dc", "f_rest", "opacity", "scaling", "rotation"
+    Returns:
+        cleaned dict (may have fewer rows)
+    """
+    if merged["xyz"].shape[0] == 0:
+        return merged
+
+    # Step 1: Fix zero-norm quaternions
+    rot = merged["rotation"]
+    q_norms = torch.linalg.norm(rot, dim=-1)
+    zero_q_mask = q_norms < 1e-8
+    if zero_q_mask.any():
+        identity_q = torch.zeros_like(rot[0])
+        identity_q[0] = 1.0
+        rot = rot.clone()
+        rot[zero_q_mask] = identity_q
+        merged["rotation"] = rot
+
+    # Step 2: Build a valid-row mask (no NaN/Inf in any parameter)
+    n = merged["xyz"].shape[0]
+    valid = torch.ones(n, dtype=torch.bool, device=merged["xyz"].device)
+    for key in ["xyz", "scaling", "opacity", "rotation"]:
+        if key in merged:
+            v = merged[key]
+            valid &= torch.isfinite(v).view(n, -1).all(dim=-1)
+
+    # Step 3: Filter if needed
+    if valid.all():
+        return merged
+
+    result = {}
+    for key, val in merged.items():
+        result[key] = val[valid]
+    return result
+

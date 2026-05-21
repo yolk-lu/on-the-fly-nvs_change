@@ -106,7 +106,7 @@ def get_t_s(d):
 def align_samples(tri_idepth: torch.Tensor, mono_idepth: torch.Tensor):
     t_tri, s_tri = get_t_s(tri_idepth)
     t_mono, s_mono = get_t_s(mono_idepth)
-    scale = s_tri / s_mono
+    scale = s_tri / s_mono.clamp_min(1e-8)
     offset = t_tri - t_mono * scale
     return mono_idepth * scale + offset, scale, offset
 

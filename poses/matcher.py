@@ -10,6 +10,8 @@
 #
 
 import torch
+import os
+import sys
 
 from poses.ransac import EstimatorType, RANSACEstimator
 
@@ -56,18 +58,110 @@ def match(feats1, feats2, min_cossim=0.82,
 
 class Matcher:
     @torch.no_grad()
-    def __init__(self, fundmat_samples: int, max_error: float, sem_weight: float = 0.0):
+    def __init__(
+        self,
+        fundmat_samples: int,
+        max_error: float,
+        sem_weight: float = 0.0,
+        matcher_backend: str = "mnn",
+        feature_backend: str = "xfeat",
+        lightglue_filter_threshold: float = 0.1,
+        lightglue_depth_confidence: float = 0.95,
+        lightglue_width_confidence: float = 0.99,
+    ):
         """
         Initialize the Matcher.
         Args:
             fundmat_samples (int): Number of RANSAC etimations when estimating inliers with fundamental matrix estimation.
             max_error (float): Maximum error for RANSAC inlier threshold.
             sem_weight (float): Weight of semantic similarity in matching score (0-1).
+            matcher_backend (str): Matching backend: "mnn" or "lightglue".
+            feature_backend (str): Feature extractor backend used with matcher.
         """
         self.max_error = max_error
         self.sem_weight = sem_weight
+        self.matcher_backend = matcher_backend.lower()
+        self.feature_backend = feature_backend.lower()
         self.fundmat_estimator = RANSACEstimator(
             fundmat_samples, max_error, EstimatorType.FUNDAMENTAL_8PTS
+        )
+        self.lightglue_matcher = None
+
+        if self.matcher_backend == "lightglue":
+            supported_features = {"superpoint", "disk", "sift", "aliked"}
+            if self.feature_backend not in supported_features:
+                raise ValueError(
+                    f"LightGlue matcher requires feature_backend in {sorted(supported_features)}, "
+                    f"got '{self.feature_backend}'."
+                )
+            lg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "submodules", "LightGlue"))
+            if lg_root not in sys.path:
+                sys.path.insert(0, lg_root)
+            from lightglue import LightGlue
+
+            self.lightglue_matcher = LightGlue(
+                features=self.feature_backend,
+                filter_threshold=lightglue_filter_threshold,
+                depth_confidence=lightglue_depth_confidence,
+                width_confidence=lightglue_width_confidence,
+            ).eval().cuda()
+        elif self.matcher_backend != "mnn":
+            raise ValueError(
+                f"Unsupported matcher backend '{self.matcher_backend}'. Use one of: mnn, lightglue."
+            )
+
+    def _resolve_image_size(self, desc_kpts: 'DescribedKeypoints'):
+        image_size = desc_kpts.meta.get("image_size") if hasattr(desc_kpts, "meta") else None
+        if isinstance(image_size, torch.Tensor):
+            return image_size.float()
+        if len(desc_kpts.kpts) == 0:
+            return torch.tensor([1.0, 1.0], device=desc_kpts.kpts.device)
+        min_xy = desc_kpts.kpts.min(dim=0).values
+        max_xy = desc_kpts.kpts.max(dim=0).values
+        # image_size follows [width, height]
+        wh = (max_xy - min_xy + 1.0).clamp_min(1.0)
+        return wh.float()
+
+    def _lightglue_match(self, desc_kpts: 'DescribedKeypoints', desc_kpts_other: 'DescribedKeypoints'):
+        out_device = torch.device("cuda" if torch.cuda.is_available() else desc_kpts.kpts.device)
+        if len(desc_kpts.kpts) == 0 or len(desc_kpts_other.kpts) == 0:
+            empty = torch.empty(0, dtype=torch.long, device=out_device)
+            return empty, empty, torch.empty(0, dtype=torch.bool, device=out_device)
+
+        image0 = {
+            "keypoints": desc_kpts.kpts[None].float().cuda(),
+            "descriptors": desc_kpts.feats[None].float().cuda(),
+            "image_size": self._resolve_image_size(desc_kpts)[None].float().cuda(),
+        }
+        image1 = {
+            "keypoints": desc_kpts_other.kpts[None].float().cuda(),
+            "descriptors": desc_kpts_other.feats[None].float().cuda(),
+            "image_size": self._resolve_image_size(desc_kpts_other)[None].float().cuda(),
+        }
+        for key in ("scales", "oris"):
+            value0 = desc_kpts.meta.get(key) if hasattr(desc_kpts, "meta") else None
+            value1 = desc_kpts_other.meta.get(key) if hasattr(desc_kpts_other, "meta") else None
+            if isinstance(value0, torch.Tensor) and isinstance(value1, torch.Tensor):
+                image0[key] = value0[None].float().cuda()
+                image1[key] = value1[None].float().cuda()
+
+        matched = self.lightglue_matcher({"image0": image0, "image1": image1})
+        pair_idx = matched["matches"][0]
+        if pair_idx.numel() == 0:
+            empty = torch.empty(0, dtype=torch.long, device=out_device)
+            return empty, empty, torch.empty(0, dtype=torch.bool, device=out_device)
+
+        idx = pair_idx[:, 0].long()
+        idx_other = pair_idx[:, 1].long()
+        mask = torch.ones_like(idx, dtype=torch.bool)
+        return idx, idx_other, mask
+
+    def _mnn_match(self, desc_kpts: 'DescribedKeypoints', desc_kpts_other: 'DescribedKeypoints'):
+        return match(
+            desc_kpts.feats.cuda(), desc_kpts_other.feats.cuda(),
+            sem_feats1=desc_kpts.sem_feats.cuda() if desc_kpts.sem_feats is not None else None,
+            sem_feats2=desc_kpts_other.sem_feats.cuda() if desc_kpts_other.sem_feats is not None else None,
+            sem_weight=self.sem_weight,
         )
 
     def evaluate_match(
@@ -76,12 +170,11 @@ class Matcher:
         """
         Get the number of matches between two sets of described keypoints.
         """
-        _, _, mask = match(
-            desc_kpts.feats.cuda(), desc_kpts_other.feats.cuda(),
-            sem_feats1=desc_kpts.sem_feats.cuda() if desc_kpts.sem_feats is not None else None,
-            sem_feats2=desc_kpts_other.sem_feats.cuda() if desc_kpts_other.sem_feats is not None else None,
-            sem_weight=self.sem_weight,
-        )
+        if self.matcher_backend == "lightglue":
+            idx, _, _ = self._lightglue_match(desc_kpts, desc_kpts_other)
+            device = "cuda" if torch.cuda.is_available() else idx.device
+            return torch.tensor(len(idx), device=device)
+        _, _, mask = self._mnn_match(desc_kpts, desc_kpts_other)
         return mask.sum()
 
     @torch.no_grad()
@@ -106,12 +199,10 @@ class Matcher:
         Returns:
             Matches: A Matches object containing the matched keypoints and their indices.
         """
-        idx, idx_other, mask = match(
-            desc_kpts.feats.cuda(), desc_kpts_other.feats.cuda(),
-            sem_feats1=desc_kpts.sem_feats.cuda() if desc_kpts.sem_feats is not None else None,
-            sem_feats2=desc_kpts_other.sem_feats.cuda() if desc_kpts_other.sem_feats is not None else None,
-            sem_weight=self.sem_weight,
-        )
+        if self.matcher_backend == "lightglue":
+            idx, idx_other, mask = self._lightglue_match(desc_kpts, desc_kpts_other)
+        else:
+            idx, idx_other, mask = self._mnn_match(desc_kpts, desc_kpts_other)
         idx = idx[mask]
         idx_other = idx_other[mask]
         kpts = desc_kpts.kpts[idx]

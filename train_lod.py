@@ -10,8 +10,13 @@
 #
 
 import os
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import time
 import csv
+import json
+from collections import deque
 
 import numpy as np
 import torch
@@ -37,8 +42,6 @@ from webviewer.webviewer import WebViewer
 from graphdecoviewer.types import ViewerMode
 from utils import align_mean_up_fwd, increment_runtime
 from resource_tracker import ResourceTracker
-
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 def _append_loss_record(records, stats, phase, lod, step_idx):
@@ -83,7 +86,8 @@ def _save_loss_records_and_plot(records, out_dir):
         ssim = [row["ssim"] for row in records]
         depth = [row["depth"] for row in records]
 
-        fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 12), sharex=True)
         axes[0].plot(steps, total, color="tab:blue", linewidth=1.2, label="total")
         axes[0].set_ylabel("Total Loss")
         axes[0].grid(alpha=0.3)
@@ -92,16 +96,37 @@ def _save_loss_records_and_plot(records, out_dir):
         axes[1].plot(steps, l1, color="tab:orange", linewidth=1.0, label="l1")
         axes[1].plot(steps, ssim, color="tab:green", linewidth=1.0, label="ssim")
         axes[1].plot(steps, depth, color="tab:red", linewidth=1.0, label="depth")
-        axes[1].set_xlabel("Optimization Step")
         axes[1].set_ylabel("Component Loss")
         axes[1].grid(alpha=0.3)
         axes[1].legend(loc="upper right")
+
 
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, "loss_curve.png"), dpi=180)
         plt.close(fig)
     except Exception as e:
         print(f"[LossPlot] Skip plotting due to error: {e}")
+
+
+def _save_lod_completion_marker(out_dir, lod_step, reconstruction_time, lod_gate, metrics):
+    os.makedirs(out_dir, exist_ok=True)
+    marker_path = os.path.join(out_dir, f"lod_{lod_step}_complete.json")
+    payload = {
+        "lod": int(lod_step),
+        "reconstruction_time": float(reconstruction_time),
+        "lod_gate": {
+            key: (float(value) if isinstance(value, (float, int)) else value)
+            for key, value in lod_gate.items()
+        },
+        "metrics": {
+            key: (float(value) if isinstance(value, (float, int)) else value)
+            for key, value in metrics.items()
+        },
+        "checkpoint_note": "single_lod_reuses_initial_full_scene_save",
+    }
+    with open(marker_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    return marker_path
 
 if __name__ == "__main__":
 
@@ -125,9 +150,19 @@ if __name__ == "__main__":
     max_error = max(args.match_max_error * width, 1.5)
     min_displacement = max(args.min_displacement * width, 30)
     matcher = Matcher(args.fundmat_samples, max_error,
-                      sem_weight=args.sem_weight if args.use_semantic_features else 0.0)
+                      sem_weight=args.sem_weight if args.use_semantic_features else 0.0,
+                      matcher_backend=args.matcher_backend,
+                      feature_backend=args.feature_backend,
+                      lightglue_filter_threshold=args.lightglue_filter_threshold,
+                      lightglue_depth_confidence=args.lightglue_depth_confidence,
+                      lightglue_width_confidence=args.lightglue_width_confidence)
     triangulator = Triangulator(
-        args.num_kpts, args.num_prev_keyframes_miniba_incr, max_error
+        args.num_kpts,
+        args.num_prev_keyframes_miniba_incr,
+        max_error,
+        use_parallax_ba=args.use_parallax_ba,
+        parallax_iters=args.parallax_ba_iters,
+        parallax_ref_weight=args.parallax_ref_weight,
     )
     pose_initializer = PoseInitializer(
         width, height, triangulator, matcher, 2 * max_error, args
@@ -142,7 +177,13 @@ if __name__ == "__main__":
         from poses.semantic_extractor import SemanticExtractor
         semantic_extractor = SemanticExtractor(width, height, sem_dim=args.sem_feat_dim)
         print(f"Semantic features enabled (dim={args.sem_feat_dim}, weight={args.sem_weight})")
-    detector = Detector(args.num_kpts, width, height, semantic_extractor=semantic_extractor)
+    detector = Detector(
+        args.num_kpts,
+        width,
+        height,
+        semantic_extractor=semantic_extractor,
+        feature_backend=args.feature_backend,
+    )
 
     # Initialize the viewer
     if args.viewer_mode in ["server", "local"]:
@@ -176,12 +217,15 @@ if __name__ == "__main__":
     metrics = {}
     loss_records = []
     loss_step_idx = 0
+    pending_pose_queue = deque()
+    retry_per_success = 2
 
     ## Scene reconstruction
     print(f"Starting reconstruction for {args.source_path}")
     pbar = tqdm(range(0, len(dataset)))
     reconstruction_start_time = time.time()
     for frameID in pbar:
+        extra_registered_this_frame = 0
         # start_time = time.time()
         tracker.start("Load")
 
@@ -202,6 +246,7 @@ if __name__ == "__main__":
         
         if n_keyframes == 0:
             image, info = dataset.getnext()
+            info["frame_id"] = int(frameID)
             prev_desc_kpts = detector(image)
             bootstrap_keyframe_dicts = [{"image": image, "info": info}]
             bootstrap_desc_kpts = [prev_desc_kpts]
@@ -211,6 +256,7 @@ if __name__ == "__main__":
             continue
 
         image, info = dataset.getnext()
+        info["frame_id"] = int(frameID)
         desc_kpts = detector(image)
         # Match features between the previous and current frame
         curr_prev_matches = matcher(desc_kpts, prev_desc_kpts)
@@ -267,6 +313,7 @@ if __name__ == "__main__":
                 for index in range(args.num_keyframes_miniba_bootstrap):
                     with tracker.track("Init"):
                         scene_model.add_new_gaussians(index)
+                        # scene_model.add_new_gaussians_by_levels(index)
                     # increment_runtime(runtimes["Init"], start_time)
                 # start_time = time.time()
 
@@ -319,6 +366,7 @@ if __name__ == "__main__":
                     scene_model.reset()
                     for i in range(3, 0, -1):
                         scene_model.add_new_gaussians(-i)
+                        # scene_model.add_new_gaussians_by_levels(-i)
                     for _ in range(3 * args.num_iterations):
                         loss_stats = scene_model.optimization_step()
                         loss_step_idx = _append_loss_record(
@@ -343,7 +391,14 @@ if __name__ == "__main__":
                 
                 with tracker.track("BAI"):
                     Rt = pose_initializer.initialize_incremental(
-                        prev_keyframes, desc_kpts, n_keyframes, info["is_test"], image
+                        prev_keyframes,
+                        desc_kpts,
+                        n_keyframes,
+                        info["is_test"],
+                        image,
+                        all_keyframes=scene_model.keyframes,
+                        retry_count=0,
+                        frame_uid=info.get("frame_id"),
                     )
                 
                 # increment_runtime(runtimes["BAI"], start_time)
@@ -373,6 +428,7 @@ if __name__ == "__main__":
                     # start_time = time.time()
                     with tracker.track("Init"):
                         scene_model.add_new_gaussians()
+                        # scene_model.add_new_gaussians_by_levels()
                     # increment_runtime(runtimes["Init"], start_time)
                     # start_time = time.time()
 
@@ -390,8 +446,98 @@ if __name__ == "__main__":
                                 step_idx=loss_step_idx,
                             )
                     # increment_runtime(runtimes["Opt"], start_time)
+
+                    # Retry pending frames after each successful registration
+                    if len(pending_pose_queue) > 0:
+                        retries = min(retry_per_success, len(pending_pose_queue))
+                        for _ in range(retries):
+                            pending = pending_pose_queue.popleft()
+                            p_img = pending["image"]
+                            p_info = pending["info"]
+                            p_desc = pending["desc_kpts"]
+                            p_retry_count = pending["retry_count"]
+                            retry_index = n_keyframes + 1 + extra_registered_this_frame
+
+                            with tracker.track("tri_retry"):
+                                retry_prev_keyframes = scene_model.get_prev_keyframes(
+                                    args.num_prev_keyframes_miniba_incr, True, p_desc
+                                )
+                            with tracker.track("BAI_retry"):
+                                Rt_retry = pose_initializer.initialize_incremental(
+                                    retry_prev_keyframes,
+                                    p_desc,
+                                    retry_index,
+                                    p_info["is_test"],
+                                    p_img,
+                                    all_keyframes=scene_model.keyframes,
+                                    retry_count=p_retry_count,
+                                    frame_uid=p_info.get("frame_id", retry_index),
+                                )
+
+                            if Rt_retry is not None:
+                                with tracker.track("Add_retry"):
+                                    if args.use_colmap_poses:
+                                        Rt_retry = p_info["Rt"]
+                                    retry_keyframe = Keyframe(
+                                        p_img,
+                                        p_info,
+                                        p_desc,
+                                        Rt_retry,
+                                        retry_index,
+                                        f,
+                                        dense_extractor,
+                                        depth_estimator,
+                                        triangulator,
+                                        args,
+                                    )
+                                    scene_model.add_keyframe(retry_keyframe)
+
+                                with tracker.track("Init_retry"):
+                                    scene_model.add_new_gaussians()
+
+                                with tracker.track("Opt_retry"):
+                                    if is_stream:
+                                        scene_model.optimize_async(args.num_iterations)
+                                    else:
+                                        loss_stats = scene_model.optimization_loop(args.num_iterations)
+                                        loss_step_idx = _append_loss_record(
+                                            loss_records,
+                                            loss_stats,
+                                            phase="incremental_retry_opt",
+                                            lod=scene_model.current_lod,
+                                            step_idx=loss_step_idx,
+                                        )
+
+                                with tracker.track("anc_retry"):
+                                    scene_model.place_anchor_if_needed()
+                                extra_registered_this_frame += 1
+                            else:
+                                if (
+                                    pose_initializer.last_failure_reason == "lsf_velocity_gate"
+                                    and p_retry_count < args.pose_retry_max_attempts
+                                ):
+                                    pending["retry_count"] = p_retry_count + 1
+                                    if len(pending_pose_queue) < args.pose_retry_queue_size:
+                                        pending_pose_queue.append(pending)
                 else:
                     should_add_keyframe = False
+                    if (
+                        pose_initializer.last_failure_reason == "lsf_velocity_gate"
+                        and not info["is_test"]
+                        and args.pose_retry_max_attempts > 0
+                    ):
+                        pending_item = {
+                            "image": image,
+                            "info": info,
+                            "desc_kpts": desc_kpts,
+                            "retry_count": 1,
+                        }
+                        if len(pending_pose_queue) < args.pose_retry_queue_size:
+                            pending_pose_queue.append(pending_item)
+                        else:
+                            print(
+                                f"[PoseRetry] Queue full ({args.pose_retry_queue_size}), dropping frame {frameID}."
+                            )
 
         if should_add_keyframe:
             ## Check if anchor creation is needed based on the primitives' size 
@@ -399,7 +545,7 @@ if __name__ == "__main__":
             with tracker.track("anc"):
                 scene_model.place_anchor_if_needed()
             # increment_runtime(runtimes["anc"], start_time)
-            n_keyframes += 1
+            n_keyframes += 1 + extra_registered_this_frame
             if not info["is_test"]:
                 prev_desc_kpts = desc_kpts
 
@@ -572,7 +718,16 @@ if __name__ == "__main__":
 
         scene_model.inference_mode = True
         print(f"Saving LoD {current_lod_step} completion checkpoint to {save_dir}")
-        scene_model.save(save_dir, reconstruction_time)
+        if args.lod_min == args.lod_max:
+            marker_path = _save_lod_completion_marker(
+                save_dir, current_lod_step, reconstruction_time, lod_gate, metrics
+            )
+            print(
+                f"Single-LoD checkpoint reuses the initial full scene save; "
+                f"completion marker written to {marker_path}"
+            )
+        else:
+            scene_model.save(save_dir, reconstruction_time)
         scene_model.inference_mode = False
 
         # Increase LoD if not at max

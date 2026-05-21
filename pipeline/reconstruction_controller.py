@@ -28,6 +28,7 @@ class AnchorPoseUpdate:
     anchor_id: int
     R_anchor_to_world: torch.Tensor
     t_anchor_to_world: torch.Tensor
+    s_anchor_to_world: torch.Tensor | float = 1.0
 
 
 class ReconstructionController:
@@ -54,6 +55,7 @@ class ReconstructionController:
         self.mapping_queue: queue.Queue[MappingTask | None] = queue.Queue(maxsize=int(mapping_queue_size))
         self.mapping_thread: threading.Thread | None = None
         self.mapping_errors: list[str] = []
+        self.last_pose_graph_result = None
 
     def create_anchor(
         self,
@@ -67,10 +69,16 @@ class ReconstructionController:
             anchor.R_anchor_to_world = R_anchor_to_world.to(self.device)
         if t_anchor_to_world is not None:
             anchor.t_anchor_to_world = t_anchor_to_world.to(self.device)
+        anchor.s_anchor_to_world = anchor.s_anchor_to_world.to(self.device)
         scale_alignment = None
         if reference_frame is not None and new_frame is not None:
             scale_alignment = self.align_inter_anchor_scale(reference_frame, new_frame)
             anchor.scale_alignment = scale_alignment
+            if len(self.anchors) > 0:
+                anchor.s_anchor_to_world = (
+                    self.anchors[-1].s_anchor_to_world.to(self.device)
+                    * scale_alignment.global_scale.to(self.device).clamp_min(1e-8)
+                )
         self.anchors.append(anchor)
         self.anchor_locks[anchor.anchor_id] = ReadWriteLock()
         self.graph.add_node(anchor.anchor_id, anchor.T_anchor_to_world)
@@ -108,13 +116,65 @@ class ReconstructionController:
         max_anchor_radius: float = 25.0,
         min_keyframes: int = 20,
     ) -> bool:
+        return self.anchor_budget_status(
+            cam_centre_world,
+            max_anchor_radius=max_anchor_radius,
+            min_keyframes=min_keyframes,
+        )["should_roll"]
+
+    def anchor_budget_status(
+        self,
+        cam_centre_world: torch.Tensor | None = None,
+        max_anchor_radius: float = 0.0,
+        min_keyframes: int = 0,
+        max_gaussians: int = 0,
+        max_keyframes: int = 0,
+        max_tsdf_voxels: int = 0,
+        max_vram_mb: float = 0.0,
+    ) -> dict:
         if len(self.anchors) == 0:
-            return True
+            return {"should_roll": True, "reasons": ["no_anchor"]}
         anchor = self.active_anchor()
         with self.anchor_locks[anchor.anchor_id].read_lock():
-            dist = torch.linalg.vector_norm(cam_centre_world.to(anchor.device) - anchor.t_anchor_to_world)
-            enough_frames = len(anchor.keyframe_ids) >= int(min_keyframes)
-        return bool(enough_frames and dist.item() > float(max_anchor_radius))
+            n_gaussians = int(anchor.gaussian_model.n)
+            n_keyframes = int(len(anchor.keyframe_ids))
+            n_tsdf_voxels = int(anchor.tsdf.keys.shape[0])
+            dist = 0.0
+            if cam_centre_world is not None:
+                dist = float(torch.linalg.vector_norm(cam_centre_world.to(anchor.device) - anchor.t_anchor_to_world).item())
+        reasons = []
+        if int(max_gaussians) > 0 and n_gaussians >= int(max_gaussians):
+            reasons.append("max_anchor_gaussians")
+        if int(max_keyframes) > 0 and n_keyframes >= int(max_keyframes):
+            reasons.append("max_anchor_keyframes")
+        if int(max_tsdf_voxels) > 0 and n_tsdf_voxels >= int(max_tsdf_voxels):
+            reasons.append("max_anchor_tsdf_voxels")
+        if float(max_anchor_radius) > 0 and n_keyframes >= int(min_keyframes) and dist > float(max_anchor_radius):
+            reasons.append("anchor_radius")
+        gpu_used_mb = 0.0
+        if float(max_vram_mb) > 0 and torch.cuda.is_available():
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            gpu_used_mb = float((total_bytes - free_bytes) / 1024 / 1024)
+            if gpu_used_mb >= float(max_vram_mb):
+                reasons.append("max_anchor_vram_mb")
+        return {
+            "should_roll": len(reasons) > 0,
+            "reasons": reasons,
+            "anchor_id": int(anchor.anchor_id),
+            "num_gaussians": n_gaussians,
+            "num_keyframes": n_keyframes,
+            "num_tsdf_voxels": n_tsdf_voxels,
+            "distance_from_anchor": dist,
+            "gpu_used_mb": gpu_used_mb,
+            "limits": {
+                "max_anchor_radius": float(max_anchor_radius),
+                "min_keyframes": int(min_keyframes),
+                "max_gaussians": int(max_gaussians),
+                "max_keyframes": int(max_keyframes),
+                "max_tsdf_voxels": int(max_tsdf_voxels),
+                "max_vram_mb": float(max_vram_mb),
+            },
+        }
 
     def seal_active_anchor(self) -> int:
         anchor = self.active_anchor()
@@ -137,9 +197,10 @@ class ReconstructionController:
         for update in updates:
             anchor = self.anchors[int(update.anchor_id)]
             with self.anchor_locks[anchor.anchor_id].write_lock():
-                anchor.update_pose_with_covariance_rotation(
+                anchor.update_pose_with_covariance_similarity(
                     update.R_anchor_to_world.to(anchor.device),
                     update.t_anchor_to_world.to(anchor.device),
+                    update.s_anchor_to_world,
                 )
                 self.graph.add_node(anchor.anchor_id, anchor.T_anchor_to_world)
 
@@ -200,6 +261,27 @@ class ReconstructionController:
             self.graph.add_loop_edge(src_anchor_id, dst_anchor_id, T_src_to_dst.to(self.device), weight=weight)
         return result
 
+    def optimize_anchor_graph(self, optimizer) -> object:
+        result = optimizer.optimize(self.graph)
+        self.last_pose_graph_result = result
+        if getattr(result, "converged", False) and len(getattr(result, "updates", [])) > 0:
+            self.apply_anchor_pose_updates(result.updates)
+        return result
+
+    def pose_graph_summary(self) -> dict:
+        edges = self.graph.edges
+        return {
+            "enabled": True,
+            "num_nodes": len(self.graph.nodes),
+            "num_edges": len(edges),
+            "num_sequential_edges": sum(1 for edge in edges if edge.kind == "sequential"),
+            "num_loop_edges": sum(1 for edge in edges if edge.kind == "loop"),
+            "last_converged": bool(getattr(self.last_pose_graph_result, "converged", False)),
+            "last_initial_residual": float(getattr(self.last_pose_graph_result, "initial_residual", 0.0)),
+            "last_final_residual": float(getattr(self.last_pose_graph_result, "final_residual", 0.0)),
+            "last_reason": str(getattr(self.last_pose_graph_result, "reason", "not_run")),
+        }
+
     def state_summary(self) -> dict:
         return {
             "num_anchors": len(self.anchors),
@@ -209,4 +291,5 @@ class ReconstructionController:
             "num_gaussians": sum(anchor.gaussian_model.n for anchor in self.anchors),
             "mapping_queue_size": self.mapping_queue.qsize(),
             "mapping_errors": list(self.mapping_errors),
+            "pose_graph_optimization": self.pose_graph_summary(),
         }

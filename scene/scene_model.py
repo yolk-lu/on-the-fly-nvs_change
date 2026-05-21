@@ -14,6 +14,7 @@ import gc
 import os
 import json
 import math
+import csv
 import threading
 import time
 import warnings
@@ -21,6 +22,7 @@ import cv2
 import torch
 import torch.nn.functional as F
 import numpy as np
+import torchvision
 
 import lpips
 from fused_ssim import fused_ssim
@@ -36,10 +38,10 @@ from scene.optimizers import SparseGaussianAdam
 from scene.keyframe import Keyframe
 from scene.anchor import Anchor
 from scene.LoD_utils import (
+    
     projected_major_axis_px,
-    distance_boundary_penalty,
-    gaussian_aspect_ratio_mask,
-    aspect_ratio_penalty,
+    screenspace_clamp,
+    validate_merged_gaussians,
 )
 from utils import (
     RGB2SH,
@@ -80,8 +82,13 @@ class SceneModel:
         self.height = height
         self.matcher = matcher
         self.centre = torch.tensor([(width - 1) / 2, (height - 1) / 2], device="cuda")
-        self.anchor_overlap = args.anchor_overlap
+        self.anchor_overlap = getattr(args, "anchor_overlap", 0.0)
+        self.model_path = getattr(args, "model_path", "/tmp/lod_debug_fallback")
+        self.progressive_loss_hook = None
+        self.progressive_tsdf_loss_weight = float(getattr(args, "progressive_tsdf_loss_weight", 0.0))
+        self.progressive_anisotropy_loss_weight = float(getattr(args, "progressive_anisotropy_loss_weight", 0.0))
         self.optimization_thread = None
+        self.debug_log_lock = threading.Lock()
 
         try:
             import sys
@@ -325,19 +332,27 @@ class SceneModel:
         l1_loss = (image - gt_image).abs().mean()
         ssim_loss = 1 - fused_ssim(image[None], gt_image[None])
         depth_loss = (invdepth - mono_idepth).abs().mean()
-        
-        # aspect_loss mathematically requires the raw un-exponentiated log_scaling tensor to enforce strict linear gradient limits
-        from scene.LoD_utils import aspect_ratio_penalty
-        aspect_loss = aspect_ratio_penalty(
-            self.gaussian_params["scaling"]["val"], 
-            max_aspect_ratio=getattr(self, "max_gaussian_aspect_ratio", 8.0)
-        )
-        
+        progressive_tsdf_loss = depth_loss * 0.0
+        progressive_anisotropy_loss = depth_loss * 0.0
+        if self.progressive_loss_hook is not None:
+            progressive_losses = self.progressive_loss_hook(self)
+            progressive_tsdf_loss = progressive_losses.get("tsdf", progressive_tsdf_loss)
+            progressive_anisotropy_loss = progressive_losses.get("anisotropy", progressive_anisotropy_loss)
+        # Measure pure depth impact on xyz gradients
+        self.optimizer.zero_grad()
+        (keyframe.depth_loss_weight * depth_loss).backward(retain_graph=True)
+        depth_xyz_grad_norm = 0.0
+        if self.gaussian_params["xyz"]["val"].grad is not None:
+            depth_xyz_grad_norm = float(self.gaussian_params["xyz"]["val"].grad.detach().norm(p=2).item())
+
+        self.optimizer.zero_grad()
+
         loss = (
             self.lambda_dssim * ssim_loss
             + (1 - self.lambda_dssim) * l1_loss
             + keyframe.depth_loss_weight * depth_loss
-            + 0.1 * aspect_loss
+            + self.progressive_tsdf_loss_weight * progressive_tsdf_loss
+            + self.progressive_anisotropy_loss_weight * progressive_anisotropy_loss
         )
         loss.backward()
 
@@ -365,6 +380,9 @@ class SceneModel:
             "l1": float(l1_loss.detach().item()),
             "ssim": float(ssim_loss.detach().item()),
             "depth": float(depth_loss.detach().item()),
+            "tsdf": float(progressive_tsdf_loss.detach().item()),
+            "anisotropy": float(progressive_anisotropy_loss.detach().item()),
+            "depth_xyz_grad": depth_xyz_grad_norm,
         }
         return self.latest_loss_stats
 
@@ -479,12 +497,50 @@ class SceneModel:
     def save_test_frames(self, out_dir):
         self.harmonize_test_exposure()
         os.makedirs(out_dir, exist_ok=True)
+
         for keyframe in self.keyframes:
             if keyframe.info["is_test"]:
                 render_pkg = self.render_from_id(keyframe.index, pyr_lvl=0)
                 image = torch.clamp(render_pkg["render"], 0, 1) * 255
                 image = image.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
                 image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+                # Combine visualizations (Render, Depth, Normal, Laplace)
+                img = keyframe.image_pyr[0].cuda()
+                img_down = F.avg_pool2d(img, 2)
+                img_down = F.interpolate(img_down[None], (self.height, self.width), mode="bilinear", align_corners=True)[0]
+                init_proba = get_lapla_norm(img_down, self.disc_kernel)
+                proba_img = init_proba / init_proba.max().clamp_min(1e-5)
+                proba_img_3c = proba_img.expand(3, -1, -1)
+
+                # Use Monocular Depth (from UniDepth / DepthAnything) instead of Rendered Depth
+                mono_depth_raw = keyframe.mono_idepth.cuda()
+                while mono_depth_raw.dim() > 2:
+                    mono_depth_raw = mono_depth_raw.squeeze(0)
+                if mono_depth_raw.dim() == 2:
+                    mono_depth_raw = mono_depth_raw.unsqueeze(0)
+                
+                # Resize mono depth to match RGB resolution (H, W)
+                mono_depth_up = F.interpolate(mono_depth_raw.unsqueeze(0), size=(self.height, self.width), mode="bilinear", align_corners=True)[0]
+                
+                depth_norm = mono_depth_up / mono_depth_up.max().clamp_min(1e-5)
+                depth_img_3c = depth_norm.expand(3, -1, -1)
+
+                # Compute Monocular Fake Normals using Depth Gradients
+                dy, dx = torch.gradient(mono_depth_up.squeeze(0))
+                # For inverse depth/depth, gradient directions might differ slightly in sign, but this is for viewing.
+                normal = torch.stack([-dx, -dy, torch.ones_like(dx)], dim=0)
+                normal = normal / torch.linalg.vector_norm(normal, dim=0, keepdim=True).clamp_min(1e-5)
+                normal_3c = (normal + 1) / 2.0
+
+                render_img = render_pkg["render"].detach().clamp(0, 1)
+                
+                grid = torchvision.utils.make_grid([render_img, depth_img_3c, normal_3c, proba_img_3c], nrow=2)
+                grid_name = "combined_" + keyframe.info["name"]
+                if grid_name.endswith((".png", ".jpg", ".jpeg")):
+                    grid_name = grid_name.rsplit(".", 1)[0] + ".png"
+                torchvision.utils.save_image(grid, os.path.join(out_dir, grid_name))
+
                 is_jpeg = os.path.splitext(keyframe.info["name"])[-1].lower() in [
                     ".jpg",
                     ".jpeg",
@@ -570,19 +626,23 @@ class SceneModel:
                     scaling = torch.ones_like(self.scaling) * scaling_modifier
                     opacity = torch.ones_like(self.opacity)
                 else:
-                    dist = torch.linalg.vector_norm(self.xyz - cam_centre[None], dim=-1).clamp_min(1e-5)
-                    # Compute projected size and shrink any Gaussian that attempts to dominate the screen
-                    # This is the ULTIMATE mathematical protection against C++ array memory crashes (Rasterizer OOMs acting as illegal memory access)
-                    max_scale = self.scaling.max(dim=-1)[0]
-                    screen_size = self.f * max_scale / dist
-                    shrink_factor = 200.0 / screen_size.clamp_min(200.0)
-                    scaling = self.scaling * shrink_factor.unsqueeze(-1)
+                    # Use tested screenspace_clamp (log-space → log-space, never mutates stored params)
+                    # Then exp() to physical-space for the rasterizer
+                    scaling = torch.exp(screenspace_clamp(
+                        self.gaussian_params["scaling"]["val"],
+                        self.xyz, cam_centre, self.f, max_screen_px=200.0
+                    ))
                     opacity = self.opacity
                     
-                actual_rot = self.rotation.contiguous()
-                if (actual_rot == 0).all(dim=-1).any():
-                    print("\n[FATAL] A Gaussian quaternion has an EXACT norm of 0! This will trigger a division-by-zero crash in the C++ rasterizer!\n")
-                    import sys; sys.exit(1)
+                raw_rot = self.gaussian_params["rotation"]["val"].contiguous()
+                rot_norm = torch.linalg.vector_norm(raw_rot, dim=-1, keepdim=True)
+                identity_rot = torch.zeros_like(raw_rot)
+                identity_rot[:, 0] = 1
+                actual_rot = torch.where(
+                    rot_norm > 1e-8,
+                    raw_rot / rot_norm.clamp_min(1e-8),
+                    identity_rot,
+                ).contiguous()
                 if torch.isnan(scaling).any() or torch.isinf(scaling).any():
                     print("\n[FATAL] Scaling passed to rasterizer contains NaN or Inf!\n")
                     import sys; sys.exit(1)
@@ -713,6 +773,84 @@ class SceneModel:
         self.optimizer.add_and_prune(self.make_dummy_ext_tensor(), valid_mask)
 
     @torch.no_grad()
+    def _sample_mono_depth_and_conf(self, keyframe: Keyframe, uv: torch.Tensor):
+        """Sample aligned monocular depth/confidence at UV coordinates."""
+        if uv.shape[0] == 0:
+            return (
+                torch.empty(0, device="cuda"),
+                torch.empty(0, device="cuda"),
+            )
+        sampler = make_torch_sampler(uv, self.width, self.height)
+        mono_idepth = F.grid_sample(
+            keyframe.get_mono_idepth()[None],
+            sampler[None, None],
+            mode="bilinear",
+            align_corners=True,
+        )[0, 0, 0]
+        mono_conf = F.grid_sample(
+            keyframe.mono_depth_conf,
+            sampler[None, None],
+            mode="bilinear",
+            align_corners=True,
+        )[0, 0, 0]
+        mono_depth = 1 / mono_idepth.clamp(1e-6, 1e6)
+        return mono_depth, mono_conf
+
+    def _append_gaussian_init_debug(self, row: dict):
+        out_dir = os.path.join(self.model_path, "debug")
+        os.makedirs(out_dir, exist_ok=True)
+        csv_path = os.path.join(out_dir, "gaussian_init_debug.csv")
+        fieldnames = [
+            "time_sec",
+            "keyframe_id",
+            "keyframe_name",
+            "mode",
+            "level",
+            "sampled_uv",
+            "valid_after_depth_conf",
+            "reliable_mvs",
+            "fallback_mono",
+            "after_occlusion",
+            "match_pts_added",
+            "new_gaussians_added",
+            "sample_proba_mean",
+            "sample_proba_max",
+            "init_proba_mean",
+            "penalty_mean",
+            "rendered_depth_used",
+        ]
+        with self.debug_log_lock:
+            write_header = not os.path.exists(csv_path)
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+
+    @torch.no_grad()
+    def _filter_new_gaussian_tensors(
+        self,
+        extension_tensors: dict[str, torch.Tensor],
+        cam_centre: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        xyz = extension_tensors["xyz"]
+        if xyz.shape[0] == 0:
+            return extension_tensors, torch.zeros(0, device=xyz.device, dtype=torch.bool)
+
+        valid = torch.ones(xyz.shape[0], device=xyz.device, dtype=torch.bool)
+        for tensor in extension_tensors.values():
+            valid &= torch.isfinite(tensor.flatten(1)).all(dim=1)
+
+        dist = torch.linalg.vector_norm(xyz - cam_centre[None], dim=-1)
+        scaling = torch.exp(extension_tensors["scaling"].clamp(-20.0, 20.0))
+        screen_size = self.f * scaling.max(dim=-1).values / dist.clamp_min(1e-6)
+        max_screen_size = 0.25 * max(self.width, self.height)
+
+        valid &= torch.isfinite(dist) & (dist > 1e-5) & (dist < 1e3)
+        valid &= torch.isfinite(screen_size) & (screen_size > 0) & (screen_size < max_screen_size)
+        return {key: tensor[valid].contiguous() for key, tensor in extension_tensors.items()}, valid
+
+    @torch.no_grad()
     def add_new_gaussians(self, keyframe_id: int = -1):
         """Use the given keyframe to add new Gaussians to the scene model."""
         keyframe = self.keyframes[keyframe_id]
@@ -727,10 +865,6 @@ class SceneModel:
 
         ## Get the pixel-wise probability to add a Gaussian
         img = keyframe.image_pyr[0]
-        img = F.avg_pool2d(img, 2)
-        img = F.interpolate(
-            img[None], (self.height, self.width), mode="bilinear", align_corners=True
-        )[0]
         init_proba = get_lapla_norm(img, self.disc_kernel) # eq. 1
 
         if keyframe.mask_pyr is not None:
@@ -743,7 +877,7 @@ class SceneModel:
             init_proba *= dilated_mask
 
         ## Compute the penalty based on the rendering from the new keyframe's point of view
-        penalty = torch.zeros_like(init_proba)
+        penalty = 0
         rendered_depth = None
         if self.xyz.shape[0] > 0:
             self.verify_no_nans("add_new_gaussians Before Render")
@@ -752,33 +886,17 @@ class SceneModel:
             rendered_depth = 1 / render_pkg["invdepth"][0].clamp_min(1e-8)
             penalty = get_lapla_norm(render, self.disc_kernel)
 
-        penalty = distance_boundary_penalty(
-            penalty,
-            self.uv,
-            self.width,
-            self.height,
-            rendered_depth=rendered_depth,
-            boundary_weight=getattr(self, "boundary_penalty_weight", 0.35),
-            distance_weight=getattr(self, "distance_penalty_weight", 0.20),
-            boundary_margin_ratio=getattr(self, "boundary_penalty_margin_ratio", 0.08),
-        )
-
         ## Define which pixels should become Gaussians
-        # Enforce resolution-independent spawn rates to prevent linear Gaussian inflation (and GPU OOM) at lower downsamplings
-        res_multiplier = (480.0 * 270.0) / (self.width * self.height)
-        eff_scaler = self.init_proba_scaler * res_multiplier
-        init_proba *= eff_scaler
-        penalty *= eff_scaler
+        init_proba *= self.init_proba_scaler
+        penalty *= self.init_proba_scaler
         
-        # Apply Distance-based LoD Density multiplier
-        from scene.LoD_utils import get_lod_density
-        depth_val = 1 / render_pkg["invdepth"][0].clamp_min(1e-8) if self.xyz.shape[0] > 0 else torch.zeros_like(init_proba)
-        density_mult = get_lod_density(depth_val[None])
-        
-        sample_proba = (init_proba - penalty) * density_mult[0]
+        sample_proba = (init_proba - penalty).clamp(0, 1)
         sample_mask = torch.rand_like(init_proba) < sample_proba # eq. 3
 
         sampled_uv = self.uv[sample_mask]
+        n_sampled_uv = int(sampled_uv.shape[0])
+        n_reliable_mvs = 0
+        n_fallback_mono = 0
         ## Initialize positions
         # Get the samples' depth with guided stereo matching
         prev_KFs = self.get_prev_keyframes(
@@ -788,12 +906,30 @@ class SceneModel:
             if keyframe.index == prev_keyframe.index:
                 prev_KFs.pop(i)
                 break
-        depth, accurate_mask = self.guided_mvs(sampled_uv, keyframe, prev_KFs)
-        valid_mask = (keyframe.sample_conf(sampled_uv) > 0.5) * (depth > 1e-6) * torch.isfinite(depth)
+        if sampled_uv.shape[0] > 0:
+            depth, accurate_mask = self.guided_mvs(sampled_uv, keyframe, prev_KFs)
+            mono_depth, mono_conf = self._sample_mono_depth_and_conf(keyframe, sampled_uv)
+            mvs_valid = (depth > 1e-6) & torch.isfinite(depth)
+            mono_valid = (mono_depth > 1e-6) & torch.isfinite(mono_depth) & (mono_conf > 0.35)
+            idepth_mvs = 1 / depth.clamp_min(1e-6)
+            idepth_mono = 1 / mono_depth.clamp_min(1e-6)
+            depth_consistent = (idepth_mvs - idepth_mono).abs() < 0.25
+            reliable_mvs = mvs_valid & accurate_mask & depth_consistent
+            fallback_mono = (~reliable_mvs) & mono_valid
+            n_reliable_mvs = int(reliable_mvs.sum().item())
+            n_fallback_mono = int(fallback_mono.sum().item())
+            depth = torch.where(reliable_mvs, depth, mono_depth)
+            accurate_mask = reliable_mvs
+            valid_mask = (keyframe.sample_conf(sampled_uv) > 0.5) & (reliable_mvs | fallback_mono)
+        else:
+            depth = torch.empty(0, device="cuda")
+            accurate_mask = torch.empty(0, device="cuda", dtype=torch.bool)
+            valid_mask = accurate_mask
         sample_mask[sample_mask.clone()] = valid_mask
         depth = depth[valid_mask]
         sampled_uv = sampled_uv[valid_mask]
         accurate_mask = accurate_mask[valid_mask]
+        n_valid_after_depth_conf = int(depth.shape[0])
 
         # Remove Gaussians that are coarser than the newpoints
         if len(self.xyz) > 0:
@@ -821,13 +957,16 @@ class SceneModel:
             depth = depth[valid_mask]
             sampled_uv = sampled_uv[valid_mask]
             accurate_mask = accurate_mask[valid_mask]
+        n_after_occlusion = int(depth.shape[0])
 
         # Get the samples' 3D positions
         new_pts = depth2points(sampled_uv, depth.unsqueeze(-1), self.f, self.centre)
         new_pts = (new_pts - keyframe.get_t()) @ keyframe.get_R()
         # Add points from matching
         match_pts = keyframe.desc_kpts.pts3d[keyframe.desc_kpts.has_pt3d]
+        n_match_pts = int(match_pts.shape[0])
         new_pts = torch.cat([new_pts, match_pts], dim=0)
+        n_new_gaussians = int(new_pts.shape[0])
 
         ## Initialize Colour
         f_dc = img[:, sample_mask]
@@ -843,11 +982,9 @@ class SceneModel:
         f_dc = RGB2SH(f_dc.permute(1, 0).unsqueeze(1))
 
         ## Initialize Scales
-        # Undo the memory-saving artificial sparsity multiplier `res_multiplier` before calculating physical base scale
-        # This prevents Gaussians from artificially inflating 2.6x to compensate for the lower spawn probability
-        sampled_init_proba = init_proba[sample_mask] / res_multiplier
+        sampled_init_proba = init_proba[sample_mask]
         match_init_proba = F.grid_sample(
-            (init_proba / res_multiplier)[None, None],
+            init_proba[None, None],
             match_sampler[None, None],
             mode="bilinear",
             align_corners=True,
@@ -887,17 +1024,16 @@ class SceneModel:
         if self.xyz.shape[0] > 0:
             # Only keep Gaussians with non neglectible opacity
             valid_gs_mask = self.opacity[:, 0] > 0.05
+            valid_gs_mask &= torch.isfinite(self.xyz).all(dim=-1)
+            valid_gs_mask &= torch.isfinite(self.gaussian_params["scaling"]["val"]).all(dim=-1)
+            valid_gs_mask &= torch.isfinite(self.gaussian_params["opacity"]["val"]).all(dim=-1)
 
             # Discard huge Gaussians
             dist = torch.linalg.vector_norm(
                 self.xyz - keyframe.approx_centre[None], dim=-1
             )
-            screen_size = self.f * self.scaling.max(dim=-1)[0] / dist
+            screen_size = self.f * self.scaling.max(dim=-1)[0] / dist.clamp_min(1e-6)
             valid_gs_mask &= screen_size < 0.5 * self.width
-            valid_gs_mask &= gaussian_aspect_ratio_mask(
-                self.gaussian_params["scaling"]["val"],
-                max_aspect_ratio=getattr(self, "max_gaussian_aspect_ratio", 8.0),
-            )
         else:
             valid_gs_mask = torch.ones(0, device="cuda", dtype=torch.bool)
 
@@ -910,8 +1046,268 @@ class SceneModel:
             "scaling": scales,
             "rotation": rots,
         }
+        extension_tensors, valid_new_mask = self._filter_new_gaussian_tensors(
+            extension_tensors, keyframe.approx_centre
+        )
+        n_match_pts = int(valid_new_mask[sampled_uv.shape[0] :].sum().item())
+        n_new_gaussians = int(extension_tensors["xyz"].shape[0])
+
         with self.lock:
             self.optimizer.add_and_prune(extension_tensors, valid_gs_mask)
+
+        self._append_gaussian_init_debug(
+            {
+                "time_sec": f"{time.time():.6f}",
+                "keyframe_id": keyframe.index,
+                "keyframe_name": keyframe.info.get("name", ""),
+                "mode": "add_new_gaussians",
+                "level": -1,
+                "sampled_uv": n_sampled_uv,
+                "valid_after_depth_conf": n_valid_after_depth_conf,
+                "reliable_mvs": n_reliable_mvs,
+                "fallback_mono": n_fallback_mono,
+                "after_occlusion": n_after_occlusion,
+                "match_pts_added": n_match_pts,
+                "new_gaussians_added": n_new_gaussians,
+                "sample_proba_mean": float(sample_proba.mean().item()),
+                "sample_proba_max": float(sample_proba.max().item()),
+                "init_proba_mean": float(init_proba.mean().item()),
+                "penalty_mean": float(penalty.mean().item()) if torch.is_tensor(penalty) else float(penalty),
+                "rendered_depth_used": int(rendered_depth is not None),
+            }
+        )
+
+    @torch.no_grad()
+    def add_new_gaussians_by_levels(self, keyframe_id: int = -1, level: int = 1):
+        """Use the given keyframe to add new Gaussians to the scene model."""
+        keyframe = self.keyframes[keyframe_id]
+        ## align the keyframe's depth
+        if keyframe.desc_kpts.has_pt3d.sum() == 0:
+            keyframe.update_3dpts(self.keyframes)
+        keyframe.align_depth()
+
+        # Skip if the keyframe is a test keyframe
+        if keyframe.info["is_test"]:
+            return
+
+        ## Get the pixel-wise probability to add a Gaussian
+        img = keyframe.image_pyr[0]
+        init_proba = get_lapla_norm(img, self.disc_kernel) # eq. 1
+
+        if keyframe.mask_pyr is not None:
+            dilated_mask = (
+                F.conv2d(
+                    keyframe.mask_pyr[0][None].float(), self.disc_kernel, padding="same"
+                )[0, 0]
+                >= 0.99
+            )
+            init_proba *= dilated_mask
+
+        ## Compute the penalty based on the rendering from the new keyframe's point of view
+        penalty = 0
+        rendered_depth = None
+        if self.xyz.shape[0] > 0:
+            self.verify_no_nans("add_new_gaussians_by_levels Before Render")
+            render_pkg = self.render_from_id(keyframe_id)
+            render = render_pkg["render"].detach()
+            rendered_depth = 1 / render_pkg["invdepth"][0].clamp_min(1e-8)
+            penalty = get_lapla_norm(render, self.disc_kernel)
+
+        ## Define which pixels should become Gaussians
+        init_proba *= self.init_proba_scaler
+        penalty *= self.init_proba_scaler
+        
+        # Apply Distance-based LoD Density multiplier (reduces far-field spawn to save VRAM)
+        from scene.LoD_utils import get_lod_density
+        depth_val = 1 / render_pkg["invdepth"][0].clamp_min(1e-8) if self.xyz.shape[0] > 0 else torch.zeros_like(init_proba)
+        density_mult = get_lod_density(depth_val[None], far_density_ratio=0.5)
+        
+        sample_proba = ((init_proba - penalty) * density_mult[0]).clamp(0, 1)
+        sample_mask = torch.rand_like(init_proba) < sample_proba # eq. 3
+
+        sampled_uv = self.uv[sample_mask]
+        n_sampled_uv = int(sampled_uv.shape[0])
+        n_reliable_mvs = 0
+        n_fallback_mono = 0
+        ## Initialize positions
+        # Get the samples' depth with guided stereo matching
+        prev_KFs = self.get_prev_keyframes(
+            self.guided_mvs.n_cams + 1, update_3dpts=False
+        )
+        for i, prev_keyframe in enumerate(prev_KFs):
+            if keyframe.index == prev_keyframe.index:
+                prev_KFs.pop(i)
+                break
+        if sampled_uv.shape[0] > 0:
+            depth, accurate_mask = self.guided_mvs(sampled_uv, keyframe, prev_KFs)
+            mono_depth, mono_conf = self._sample_mono_depth_and_conf(keyframe, sampled_uv)
+            mvs_valid = (depth > 1e-6) & torch.isfinite(depth)
+            mono_valid = (mono_depth > 1e-6) & torch.isfinite(mono_depth) & (mono_conf > 0.35)
+            idepth_mvs = 1 / depth.clamp_min(1e-6)
+            idepth_mono = 1 / mono_depth.clamp_min(1e-6)
+            depth_consistent = (idepth_mvs - idepth_mono).abs() < 0.25
+            reliable_mvs = mvs_valid & accurate_mask & depth_consistent
+            fallback_mono = (~reliable_mvs) & mono_valid
+            n_reliable_mvs = int(reliable_mvs.sum().item())
+            n_fallback_mono = int(fallback_mono.sum().item())
+            depth = torch.where(reliable_mvs, depth, mono_depth)
+            accurate_mask = reliable_mvs
+            valid_mask = (keyframe.sample_conf(sampled_uv) > 0.5) & (reliable_mvs | fallback_mono)
+        else:
+            depth = torch.empty(0, device="cuda")
+            accurate_mask = torch.empty(0, device="cuda", dtype=torch.bool)
+            valid_mask = accurate_mask
+        sample_mask[sample_mask.clone()] = valid_mask
+        depth = depth[valid_mask]
+        sampled_uv = sampled_uv[valid_mask]
+        accurate_mask = accurate_mask[valid_mask]
+        n_valid_after_depth_conf = int(depth.shape[0])
+
+        # Remove Gaussians that are coarser than the newpoints
+        if len(self.xyz) > 0:
+            main_gaussians_map = render_pkg["mainGaussID"]
+            accurate_sample_mask = sample_mask.clone()
+            accurate_sample_mask[accurate_sample_mask.clone()] = accurate_mask
+            selected_main_gaussians = main_gaussians_map[:, accurate_sample_mask]
+            ids, counts = torch.unique(
+                selected_main_gaussians[selected_main_gaussians >= 0],
+                return_counts=True,
+            )
+            valid_gs_mask = torch.ones_like(self.xyz[:, 0], dtype=torch.bool)
+            valid_gs_mask[ids] = counts < 10
+            with self.lock:
+                self.optimizer.add_and_prune(
+                    self.make_dummy_ext_tensor(), valid_gs_mask
+                )
+            render_pkg = self.render_from_id(keyframe_id)
+            rendered_depth = 1 / render_pkg["invdepth"][0].clamp_min(1e-8)
+
+        # Check for occlusions
+        if rendered_depth is not None:
+            valid_mask = depth < rendered_depth[sample_mask]
+            sample_mask[sample_mask.clone()] = valid_mask
+            depth = depth[valid_mask]
+            sampled_uv = sampled_uv[valid_mask]
+            accurate_mask = accurate_mask[valid_mask]
+        n_after_occlusion = int(depth.shape[0])
+
+        # Get the samples' 3D positions
+        new_pts = depth2points(sampled_uv, depth.unsqueeze(-1), self.f, self.centre)
+        new_pts = (new_pts - keyframe.get_t()) @ keyframe.get_R()
+        # Add points from matching
+        match_pts = keyframe.desc_kpts.pts3d[keyframe.desc_kpts.has_pt3d]
+        n_match_pts = int(match_pts.shape[0])
+        new_pts = torch.cat([new_pts, match_pts], dim=0)
+        n_new_gaussians = int(new_pts.shape[0])
+
+        ## Initialize Colour
+        f_dc = img[:, sample_mask]
+        match_sampler = keyframe.desc_kpts.kpts[keyframe.desc_kpts.has_pt3d]
+        match_sampler = make_torch_sampler(match_sampler, self.width, self.height)
+        match_colors = F.grid_sample(
+            img[None],
+            match_sampler[None, None],
+            mode="bilinear",
+            align_corners=True,
+        ).view(3, -1)
+        f_dc = torch.cat([f_dc, match_colors], dim=1)
+        f_dc = RGB2SH(f_dc.permute(1, 0).unsqueeze(1))
+
+        ## Initialize Scales
+        sampled_init_proba = init_proba[sample_mask]
+        match_init_proba = F.grid_sample(
+            init_proba[None, None],
+            match_sampler[None, None],
+            mode="bilinear",
+            align_corners=True,
+        ).view(-1)
+        sampled_init_proba = torch.cat([sampled_init_proba, match_init_proba], dim=0)
+        # Expected distance to the nearest neighbour (eq. 4)
+        scales = 1 / (torch.sqrt(sampled_init_proba))
+        scales.clamp_(1, self.width / 10)
+        # Scale by the distance to the camera centre
+        scales.mul_(1 / self.f)
+        scales *= torch.linalg.vector_norm(
+            new_pts - keyframe.approx_centre[None], dim=-1
+        )
+        scales = torch.log(scales.clamp(1e-6, 1e6)).unsqueeze(-1).repeat(1, 3)
+
+        ## Initialize opacities
+        opacities = torch.ones(f_dc.shape[0], 1, device="cuda")
+        # Lower inital opacity depending for innacurate points
+        opacities[: sampled_uv.shape[0]] *= (
+            0.07 * accurate_mask[..., None] + 0.02 * ~accurate_mask[..., None]
+        )
+        # High opacity for triangulated Gaussians
+        opacities[sampled_uv.shape[0] :] *= 0.2
+        opacities = inverse_sigmoid(opacities)
+
+        ## Initialize SH, rotations as identity
+        f_rest = torch.zeros(
+            f_dc.shape[0],
+            (self.max_sh_degree + 1) * (self.max_sh_degree + 1) - 1,
+            3,
+            device="cuda",
+        )
+        rots = torch.zeros(f_dc.shape[0], 4, device="cuda")
+        rots[:, 0] = 1
+
+        ## Get which Gaussians should be pruned
+        if self.xyz.shape[0] > 0:
+            # Only keep Gaussians with non neglectible opacity
+            valid_gs_mask = self.opacity[:, 0] > 0.05
+            valid_gs_mask &= torch.isfinite(self.xyz).all(dim=-1)
+            valid_gs_mask &= torch.isfinite(self.gaussian_params["scaling"]["val"]).all(dim=-1)
+            valid_gs_mask &= torch.isfinite(self.gaussian_params["opacity"]["val"]).all(dim=-1)
+
+            # Discard huge Gaussians
+            dist = torch.linalg.vector_norm(
+                self.xyz - keyframe.approx_centre[None], dim=-1
+            )
+            screen_size = self.f * self.scaling.max(dim=-1)[0] / dist.clamp_min(1e-6)
+            valid_gs_mask &= screen_size < 0.5 * self.width
+        else:
+            valid_gs_mask = torch.ones(0, device="cuda", dtype=torch.bool)
+
+        ## Append the new Gaussians
+        extension_tensors = {
+            "xyz": new_pts,
+            "f_dc": f_dc,
+            "f_rest": f_rest,
+            "opacity": opacities,
+            "scaling": scales,
+            "rotation": rots,
+        }
+        extension_tensors, valid_new_mask = self._filter_new_gaussian_tensors(
+            extension_tensors, keyframe.approx_centre
+        )
+        n_match_pts = int(valid_new_mask[sampled_uv.shape[0] :].sum().item())
+        n_new_gaussians = int(extension_tensors["xyz"].shape[0])
+        with self.lock:
+            self.optimizer.add_and_prune(extension_tensors, valid_gs_mask)
+
+        self._append_gaussian_init_debug(
+            {
+                "time_sec": f"{time.time():.6f}",
+                "keyframe_id": keyframe.index,
+                "keyframe_name": keyframe.info.get("name", ""),
+                "mode": "add_new_gaussians_by_levels",
+                "level": int(level),
+                "sampled_uv": n_sampled_uv,
+                "valid_after_depth_conf": n_valid_after_depth_conf,
+                "reliable_mvs": n_reliable_mvs,
+                "fallback_mono": n_fallback_mono,
+                "after_occlusion": n_after_occlusion,
+                "match_pts_added": n_match_pts,
+                "new_gaussians_added": n_new_gaussians,
+                "sample_proba_mean": float(sample_proba.mean().item()),
+                "sample_proba_max": float(sample_proba.max().item()),
+                "init_proba_mean": float(init_proba.mean().item()),
+                "penalty_mean": float(penalty.mean().item()) if torch.is_tensor(penalty) else float(penalty),
+                "rendered_depth_used": int(rendered_depth is not None),
+            }
+        )
+
 
     def init_intrinsics(self):
         self.FoVx = focal2fov(self.f, self.width)
@@ -1047,53 +1443,123 @@ class SceneModel:
                     xyz = small_gaussians["xyz"].contiguous()
                     small_screen_size = screen_size[small_mask]
 
+                    if xyz.shape[0] <= k:
+                        return
+
                     _, nn_idx = distIndex2(xyz, k)
                     nn_idx = nn_idx.view(-1, k)
                     
                     M = int(xyz.shape[0] / (k + 1))
+                    if M <= 0:
+                        return
                     perm = torch.randperm(xyz.shape[0], device=xyz.device)
                     idx = perm[: M]
                     selected_nn_idx = torch.cat([idx[..., None], nn_idx[idx]], dim=-1)
                     
                     # Compute merging weights based on contribution to the rendering
-                    weights = small_gaussians["opacity"][selected_nn_idx, 0].sigmoid() * (small_screen_size[selected_nn_idx] ** 2)
-                    
-                    # Safe weight normalization to prevent division by zero
+                    weights = small_gaussians["opacity"][selected_nn_idx, 0].sigmoid() * (
+                        small_screen_size[selected_nn_idx] ** 2
+                    )
                     weights_sum = weights.sum(dim=-1, keepdim=True)
                     valid_mask = torch.ones_like(weights, dtype=torch.bool)
                     weights = torch.where(
                         weights_sum > 1e-8,
-                        weights / weights_sum,
-                        valid_mask.float() / valid_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                        weights / weights_sum.clamp_min(1e-8),
+                        valid_mask.float()
+                        / valid_mask.sum(dim=-1, keepdim=True).clamp_min(1.0),
                     )
                     weights.unsqueeze_(-1)
 
-                    # Align quaternions to prevent polarity cancellation (q and -q) which sum to [0,0,0,0] and crash CUDA rasterizer
+                    cluster_xyz = small_gaussians["xyz"][selected_nn_idx, :]
+                    merged_xyz = (cluster_xyz * weights).sum(dim=1)
+                    cluster_radius = torch.linalg.vector_norm(
+                        cluster_xyz - merged_xyz[:, None, :], dim=-1
+                    ).amax(dim=1)
+                    cluster_scale = (
+                        torch.exp(small_gaussians["scaling"][selected_nn_idx, :])
+                        .amax(dim=-1)
+                        .median(dim=1)
+                        .values
+                    )
+                    cluster_cam_dist = torch.linalg.vector_norm(
+                        merged_xyz - self.approx_cam_centres[-1][None], dim=-1
+                    ).clamp_min(1e-6)
+                    max_merge_radius = torch.maximum(
+                        6.0 * cluster_scale,
+                        0.02 * cluster_cam_dist,
+                    )
+                    reliable_cluster_mask = (
+                        torch.isfinite(cluster_xyz).all(dim=(1, 2))
+                        & torch.isfinite(weights.squeeze(-1)).all(dim=1)
+                        & torch.isfinite(cluster_radius)
+                        & (cluster_radius <= max_merge_radius)
+                    )
+                    if not reliable_cluster_mask.any():
+                        return
+
+                    selected_nn_idx = selected_nn_idx[reliable_cluster_mask]
+                    weights = weights[reliable_cluster_mask]
+                    valid_mask = valid_mask[reliable_cluster_mask]
+                    merged_xyz = merged_xyz[reliable_cluster_mask]
+
+                    # Align quaternions before averaging so q and -q do not cancel out.
                     rots = small_gaussians["rotation"][selected_nn_idx, :]
                     base_rot = rots[:, 0:1, :]
                     dot_product = (rots * base_rot).sum(dim=-1, keepdim=True)
                     rots = torch.where(dot_product < 0, -rots, rots)
                     merged_rots = (rots * weights).sum(dim=1)
-                    merged_rots = torch.nn.functional.normalize(merged_rots, dim=-1)
+                    rot_norm = torch.linalg.vector_norm(merged_rots, dim=-1, keepdim=True)
+                    identity_rot = torch.zeros_like(merged_rots)
+                    identity_rot[:, 0] = 1
+                    merged_rots = torch.where(
+                        rot_norm > 1e-8,
+                        merged_rots / rot_norm.clamp_min(1e-8),
+                        identity_rot,
+                    )
 
-                    # Merge the Gaussians by averaging their parameters
                     valid_counts = valid_mask.sum(dim=-1, keepdim=True).unsqueeze(-1)
                     merged_gaussians = {
-                        "xyz": (small_gaussians["xyz"][selected_nn_idx, :] * weights).sum(dim=1),
-                        "f_dc": (small_gaussians["f_dc"][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1),
-                        "f_rest": (small_gaussians["f_rest"][selected_nn_idx, :] * weights.unsqueeze(-1)).sum(dim=1),
-                        "opacity": inverse_sigmoid((small_gaussians["opacity"][selected_nn_idx, 0].sigmoid() * weights.squeeze(-1)).sum(dim=1).clamp(1e-4, 1-1e-4)).unsqueeze(-1),
-                        "scaling": torch.log((torch.exp(small_gaussians["scaling"][selected_nn_idx, :]) * weights * valid_counts).sum(dim=1).clamp_min(1e-8)),
+                        "xyz": merged_xyz,
+                        "f_dc": (
+                            small_gaussians["f_dc"][selected_nn_idx, :]
+                            * weights.unsqueeze(-1)
+                        ).sum(dim=1),
+                        "f_rest": (
+                            small_gaussians["f_rest"][selected_nn_idx, :]
+                            * weights.unsqueeze(-1)
+                        ).sum(dim=1),
+                        "opacity": inverse_sigmoid(
+                            (
+                                small_gaussians["opacity"][selected_nn_idx, :].sigmoid()
+                                * weights
+                            )
+                            .sum(dim=1)
+                            .clamp(1e-4, 1 - 1e-4)
+                        ),
+                        "scaling": torch.log(
+                            (
+                                torch.exp(small_gaussians["scaling"][selected_nn_idx, :])
+                                * weights
+                                * valid_counts
+                            )
+                            .sum(dim=1)
+                            .clamp_min(1e-8)
+                        ),
                         "rotation": merged_rots,
                     }
+                    merged_gaussians = validate_merged_gaussians(merged_gaussians)
 
                     # Offload the previous Gaussians to the CPU
                     self.active_anchor.duplicate_param_dict()
                     self.active_anchor.to("cpu", with_keyframes=True)
 
                     ## Add the merged Gaussians to the set of Gaussians and reset the optimizer
+                    small_ids = torch.nonzero(small_mask, as_tuple=False).view(-1)
+                    merged_small_ids = torch.unique(small_ids[selected_nn_idx.reshape(-1)])
+                    keep_existing_mask = torch.ones_like(small_mask, dtype=torch.bool)
+                    keep_existing_mask[merged_small_ids] = False
                     with self.lock:
-                        self.optimizer.add_and_prune(merged_gaussians, ~small_mask)
+                        self.optimizer.add_and_prune(merged_gaussians, keep_existing_mask)
 
                     # Create a new active anchor with the merged Gaussians
                     self.active_anchor = Anchor(

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import csv
 import glob
 import json
@@ -9,9 +8,6 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from http.server import SimpleHTTPRequestHandler
-from socketserver import TCPServer
-from threading import Thread
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -19,31 +15,25 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from args import get_args
 from dataloaders.image_dataset import ImageDataset
 from dataloaders.stream_dataset import StreamDataset
-from gaussianviewer import GaussianViewer
-from graphdecoviewer.types import ViewerMode
+from pipeline.gaussian_spawn_policy import GaussianSpawnPolicy
+from pipeline.keyframe_store import TrackingKeyframe, TrackingKeyframeStore
+from pipeline.loop_closure_manager import LoopClosureManager
+from pipeline.observation_builder import ObservationBuilder
+from pipeline.place_recognition import AnchorDescriptorIndex, DINOv2GlobalDescriptorExtractor
+from pipeline.progressive_config import ProgressiveConfig, parse_progressive_config
+from pipeline.reconstruction_controller import MappingTask, ReconstructionController
 from poses.feature_detector import Detector
 from poses.matcher import Matcher
 from poses.pose_initializer import PoseInitializer
 from poses.triangulator import Triangulator
 from resource_tracker import ResourceTracker
-from scene.LoD_utils import lod_progressive_ready
 from scene.dense_extractor import DenseExtractor
-from scene.keyframe import Keyframe
 from scene.mono_depth import MonoDepthEstimator
-from scene.scene_model import SceneModel
-from utils import align_mean_up_fwd
-from webviewer.webviewer import WebViewer
-
-
-@dataclass
-class ProgressiveRunConfig:
-    overlap_mode: str
-    backend_mode: str
-    manifest_name: str
-    run_label: str
+from scene.progressive_scene_model import ProgressiveSceneModel
+from scene.tsdf_fusion import TSDFFusion
+from utils import align_mean_up_fwd, inverse_sigmoid, make_torch_sampler, pts2px
 
 
 @dataclass
@@ -55,47 +45,9 @@ class ProgressiveState:
     loss_step_idx: int = 0
 
 
-def _parse_progressive_args(argv: list[str]) -> tuple[ProgressiveRunConfig, list[str]]:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--progressive_overlap_mode",
-        choices=["reserved", "off"],
-        default="reserved",
-        help="Reserve overlap-region optimization hooks. Actual overlap optimization is not implemented yet.",
-    )
-    parser.add_argument(
-        "--progressive_backend_mode",
-        choices=["progressive_scene_model"],
-        default="progressive_scene_model",
-        help="Training backend owned by Progressive_train.py. Anchor-local backend will replace this surface later.",
-    )
-    parser.add_argument(
-        "--progressive_manifest_name",
-        default="progressive_manifest.json",
-        help="Manifest filename written under model_path after training.",
-    )
-    parser.add_argument(
-        "--progressive_run_label",
-        default="progressive_train",
-        help="Human-readable run label stored in the manifest.",
-    )
-    progressive_args, remaining = parser.parse_known_args(argv[1:])
-    cfg = ProgressiveRunConfig(
-        overlap_mode=progressive_args.progressive_overlap_mode,
-        backend_mode=progressive_args.progressive_backend_mode,
-        manifest_name=progressive_args.progressive_manifest_name,
-        run_label=progressive_args.progressive_run_label,
-    )
-    return cfg, [argv[0], *remaining]
-
-
-def _parse_training_args(clean_argv: list[str]):
-    old_argv = sys.argv
-    sys.argv = clean_argv
-    try:
-        return get_args()
-    finally:
-        sys.argv = old_argv
+def _parse_progressive_args(argv: list[str]) -> tuple[ProgressiveConfig, list[str]]:
+    cfg = parse_progressive_config(argv)
+    return cfg, [argv[0]]
 
 
 def _append_loss_record(records: list[dict], stats: dict | None, phase: str, lod: int, step_idx: int) -> int:
@@ -110,6 +62,13 @@ def _append_loss_record(records: list[dict], stats: dict | None, phase: str, lod
             "l1": float(stats["l1"]),
             "ssim": float(stats["ssim"]),
             "depth": float(stats["depth"]),
+            "tsdf": float(stats.get("tsdf", 0.0)),
+            "anisotropy": float(stats.get("anisotropy", 0.0)),
+            "depth_valid_pixels": float(stats.get("depth_valid_pixels", 0.0)),
+            "visible_gaussians": float(stats.get("visible_gaussians", 0.0)),
+            "render_coverage": float(stats.get("render_coverage", 0.0)),
+            "ssim_weight": float(stats.get("ssim_weight", 0.0)),
+            "num_views": float(stats.get("num_views", 0.0)),
         }
     )
     return step_idx + 1
@@ -123,7 +82,23 @@ def _save_loss_records_and_plot(records: list[dict], out_dir: str) -> None:
     csv_path = os.path.join(out_dir, "loss_records.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["step", "phase", "lod", "total", "l1", "ssim", "depth"]
+            f,
+            fieldnames=[
+                "step",
+                "phase",
+                "lod",
+                "total",
+                "l1",
+                "ssim",
+                "depth",
+                "tsdf",
+                "anisotropy",
+                "depth_valid_pixels",
+                "visible_gaussians",
+                "render_coverage",
+                "ssim_weight",
+                "num_views",
+            ],
         )
         writer.writeheader()
         writer.writerows(records)
@@ -182,6 +157,10 @@ def _collect_output_status(model_path: str) -> dict:
         "metadata_json": os.path.exists(os.path.join(model_path, "metadata.json")),
         "point_clouds_dir": os.path.isdir(os.path.join(model_path, "point_clouds")),
         "anchor_ply": len(glob.glob(os.path.join(model_path, "point_clouds", "anchor_*.ply"))) > 0,
+        "anchor_states_dir": os.path.isdir(os.path.join(model_path, "anchor_states")),
+        "anchor_state_pt": len(glob.glob(os.path.join(model_path, "anchor_states", "anchor_*.pt"))) > 0,
+        "tsdf_dir": os.path.isdir(os.path.join(model_path, "tsdf")),
+        "tsdf_pt": len(glob.glob(os.path.join(model_path, "tsdf", "anchor_*.pt"))) > 0,
         "colmap_dir": os.path.isdir(os.path.join(model_path, "colmap")),
         "colmap_cameras": os.path.exists(os.path.join(model_path, "colmap", "cameras.bin")),
         "colmap_images": os.path.exists(os.path.join(model_path, "colmap", "images.bin")),
@@ -202,7 +181,7 @@ def _collect_output_status(model_path: str) -> dict:
 
 def _write_manifest(
     model_path: str,
-    cfg: ProgressiveRunConfig,
+    cfg: ProgressiveConfig,
     status: str,
     started_at: float,
     error: str = "",
@@ -226,8 +205,28 @@ def _write_manifest(
             "trainer_entrypoint": "Progressive_train.py",
             "overlap_mode": cfg.overlap_mode,
             "overlap_optimization": "reserved_not_implemented",
+            "anchor_radius": cfg.anchor_radius,
+            "anchor_min_keyframes": cfg.anchor_min_keyframes,
+            "async_mapping": cfg.async_mapping,
+            "tsdf_loss_weight": cfg.tsdf_loss_weight,
+            "anisotropy_loss_weight": cfg.anisotropy_loss_weight,
+            "local_spawn_max": cfg.local_spawn_max,
+            "local_spawn_target": cfg.local_spawn_target,
+            "surface_sample_floor": cfg.surface_sample_floor,
+            "low_frequency_spawn_fraction": cfg.low_frequency_spawn_fraction,
+            "edge_probability_threshold": cfg.edge_probability_threshold,
+            "spawn_opacity_init": cfg.spawn_opacity_init,
+            "max_rasterized_gaussians": cfg.max_rasterized_gaussians,
+            "anchor_render_check_every": cfg.anchor_render_check_every,
+            "anchor_iterations": cfg.anchor_iterations,
+            "anchor_train_views": cfg.anchor_train_views,
+            "loop_max_candidates": cfg.loop_check_max_candidates,
+            "loop_min_anchor_gap": cfg.loop_min_anchor_gap,
+            "depth_valid_epsilon": cfg.depth_valid_epsilon,
+            "pose_graph_optimization": "sim3_enabled_after_verified_loop",
             "completion_gate": "Progressive_train.py exits successfully and writes reconstruction outputs",
         },
+        "progressive_config": cfg.to_manifest(),
         "outputs": output_status,
         "error": error,
     }
@@ -238,7 +237,7 @@ def _write_manifest(
 
 
 class ProgressiveTrainer:
-    def __init__(self, args, cfg: ProgressiveRunConfig):
+    def __init__(self, args: ProgressiveConfig, cfg: ProgressiveConfig):
         self.args = args
         self.cfg = cfg
         self.dataset = None
@@ -252,20 +251,27 @@ class ProgressiveTrainer:
         self.pose_initializer = None
         self.dense_extractor = None
         self.depth_estimator = None
-        self.scene_model = None
+        self.observation_builder = None
+        self.keyframe_store = None
+        self.anchor_scene_model = None
+        self.loop_manager = None
+        self.place_index = None
         self.detector = None
-        self.viewer = None
-        self.viewer_thread = None
-        self.web_server = None
-        self.web_server_thread = None
+        self.controller = None
+        self.tsdf_fusion = TSDFFusion()
+        self.spawn_policy = None
         self.tracker = ResourceTracker()
         self.state = ProgressiveState()
         self.metrics: dict = {}
         self.loss_records: list[dict] = []
+        self.anchor_seal_events: list[dict] = []
         self.pending_pose_queue: deque[dict] = deque()
         self.bootstrap_keyframe_dicts: list[dict] = []
+        self.bootstrap_frames: list = []
         self.bootstrap_desc_kpts: list = []
-        self.prev_desc_kpts = None
+        self.prev_frame = None
+        self.frame_states: dict[int, object] = {}
+        self.current_lod = int(getattr(args, "lod_min", 1))
 
     def initialize(self) -> None:
         if "://" in self.args.source_path:
@@ -304,8 +310,15 @@ class ProgressiveTrainer:
         self.state.focal_px = float(self.pose_initializer.f_init)
         self.dense_extractor = DenseExtractor(self.width, self.height)
         self.depth_estimator = MonoDepthEstimator(self.width, self.height)
-        self.scene_model = SceneModel(self.width, self.height, self.args, self.matcher)
-
+        self.keyframe_store = TrackingKeyframeStore(
+            self.width,
+            self.height,
+            self.args,
+            self.matcher,
+            self.triangulator,
+            device="cuda",
+        )
+        self.keyframe_store.f = self.state.focal_px
         semantic_extractor = None
         if self.args.use_semantic_features:
             from poses.semantic_extractor import SemanticExtractor
@@ -319,24 +332,60 @@ class ProgressiveTrainer:
             semantic_extractor=semantic_extractor,
             feature_backend=self.args.feature_backend,
         )
-        self._initialize_viewer()
-
-    def _initialize_viewer(self) -> None:
-        if self.args.viewer_mode in ["server", "local"]:
-            viewer_mode = ViewerMode.SERVER if self.args.viewer_mode == "server" else ViewerMode.LOCAL
-            self.viewer = GaussianViewer.from_scene_model(self.scene_model, viewer_mode)
-            self.viewer_thread = Thread(target=self.viewer.run, args=(self.args.ip, self.args.port), daemon=True)
-            self.viewer_thread.start()
-            self.viewer.throttling = True
-        elif self.args.viewer_mode == "web":
-            ip = "0.0.0.0"
-            self.web_server = TCPServer((ip, 8000), SimpleHTTPRequestHandler)
-            self.web_server_thread = Thread(target=self.web_server.serve_forever, daemon=True)
-            self.web_server_thread.start()
-            print(f"Visit http://{ip}:8000/webviewer to for the viewer")
-            self.viewer = WebViewer(self.scene_model, self.args.ip, self.args.port)
-            self.viewer_thread = Thread(target=self.viewer.run, daemon=True)
-            self.viewer_thread.start()
+        self.observation_builder = ObservationBuilder(
+            detector=self.detector,
+            depth_estimator=self.depth_estimator,
+            dense_extractor=self.dense_extractor,
+            matcher=self.matcher,
+        )
+        self.controller = ReconstructionController(
+            sh_degree=self.args.sh_degree,
+            max_active_anchors=3,
+            device="cuda",
+            mapping_callback=self._mapping_step,
+        )
+        self.controller.create_anchor()
+        self.place_index = AnchorDescriptorIndex(
+            extractor=DINOv2GlobalDescriptorExtractor(
+                descriptor_dim=64,
+                use_dinov2=os.environ.get("PROGRESSIVE_USE_DINOV2", "1") != "0",
+                device="cuda",
+            ),
+            top_k=self.cfg.loop_check_max_candidates,
+        )
+        self.loop_manager = LoopClosureManager(
+            min_anchor_gap=self.cfg.loop_min_anchor_gap,
+            max_candidates=self.cfg.loop_check_max_candidates,
+            place_index=self.place_index,
+        )
+        self.anchor_scene_model = ProgressiveSceneModel(
+            controller=self.controller,
+            width=self.width,
+            height=self.height,
+            f=self.state.focal_px,
+            sh_degree=self.args.sh_degree,
+            lambda_dssim=self.args.lambda_dssim,
+            depth_loss_weight=self.args.depth_loss_weight_init,
+            depth_valid_epsilon=self.args.depth_valid_epsilon,
+            tsdf_loss_weight=self.cfg.tsdf_loss_weight,
+            anisotropy_loss_weight=self.cfg.anisotropy_loss_weight,
+            max_gaussian_aspect_ratio=getattr(self.args, "max_gaussian_aspect_ratio", 8.0),
+            max_rasterized_gaussians=self.cfg.max_rasterized_gaussians,
+            rgb_visible_weight=self.cfg.rgb_visible_weight,
+            ssim_min_coverage=self.cfg.ssim_min_coverage,
+            depth_conf_min=self.cfg.depth_conf_min,
+            robust_loss_epsilon=self.cfg.robust_loss_epsilon,
+            lr_by_name={
+                "xyz": self.args.position_lr_init,
+                "f_dc": self.args.feature_lr,
+                "f_rest": self.args.feature_lr / 20.0,
+                "opacity": self.args.opacity_lr,
+                "scaling": self.args.scaling_lr,
+                "rotation": self.args.rotation_lr,
+            },
+        )
+        if self.cfg.async_mapping:
+            self.controller.start_mapping_worker()
 
     def run(self) -> dict:
         self.initialize()
@@ -351,40 +400,29 @@ class ProgressiveTrainer:
         pbar = tqdm(range(0, len(self.dataset)))
 
         for frame_id in pbar:
-            if not self._viewer_allows_frame(pbar):
-                break
             self._process_frame(frame_id, pbar)
 
         reconstruction_time = time.time() - reconstruction_start_time
         return self._finalize(reconstruction_time)
 
-    def _viewer_allows_frame(self, pbar) -> bool:
-        if self.args.viewer_mode != "web":
-            return True
-        self.viewer.trainer_state = "running"
-        while self.viewer.state == "stop":
-            pbar.set_postfix_str("\033[31mPaused. Press the Start button in the webviewer\033[0m")
-            time.sleep(0.1)
-        if self.viewer.state == "finish":
-            self.viewer.trainer_state = "finish"
-            return False
-        return True
-
     def _process_frame(self, frame_id: int, pbar) -> None:
         self.tracker.start("Load")
         image, info = self.dataset.getnext()
-        info["frame_id"] = int(frame_id)
-        desc_kpts = self.detector(image)
+        frame = self.observation_builder.build(image, info, int(frame_id))
+        info = frame.info
+        desc_kpts = frame.desc_kpts
+        self.frame_states[int(frame.frame_id)] = frame
 
         if self.state.n_keyframes == 0:
             self.bootstrap_keyframe_dicts = [{"image": image, "info": info}]
+            self.bootstrap_frames = [frame]
             self.bootstrap_desc_kpts = [desc_kpts]
-            self.prev_desc_kpts = desc_kpts
+            self.prev_frame = frame
             self.state.n_keyframes += 1
             self.tracker.stop()
             return
 
-        curr_prev_matches = self.matcher(desc_kpts, self.prev_desc_kpts)
+        curr_prev_matches = self.observation_builder.match(frame, self.prev_frame)
         dist = torch.norm(curr_prev_matches.kpts - curr_prev_matches.kpts_other, dim=-1)
         should_add_keyframe = (
             dist.median() > self.min_displacement
@@ -393,24 +431,27 @@ class ProgressiveTrainer:
         should_add_keyframe |= info["is_test"]
         self.tracker.stop()
 
+        if not should_add_keyframe:
+            should_add_keyframe = self._promote_loop_candidate_keyframe(frame)
+
         if should_add_keyframe:
-            extra_registered = self._register_keyframe_candidate(image, info, desc_kpts)
+            extra_registered = self._register_keyframe_candidate(frame)
             should_add_keyframe = extra_registered >= 0
         else:
             extra_registered = 0
 
         if should_add_keyframe:
-            with self.tracker.track("anc"):
-                self.scene_model.place_anchor_if_needed()
             self.state.n_keyframes += 1 + extra_registered
             if not info["is_test"]:
-                self.prev_desc_kpts = desc_kpts
+                self.prev_frame = frame
             self._evaluate_and_checkpoint(frame_id)
             self._update_progress_bar(pbar)
 
-    def _register_keyframe_candidate(self, image, info: dict, desc_kpts) -> int:
+    def _register_keyframe_candidate(self, frame) -> int:
+        image, info, desc_kpts = frame.image, frame.info, frame.desc_kpts
         if self.state.n_keyframes < self.args.num_keyframes_miniba_bootstrap:
             self.bootstrap_keyframe_dicts.append({"image": image, "info": info})
+            self.bootstrap_frames.append(frame)
             self.bootstrap_desc_kpts.append(desc_kpts)
 
         if self.state.n_keyframes == self.args.num_keyframes_miniba_bootstrap - 1:
@@ -427,26 +468,29 @@ class ProgressiveTrainer:
         with self.tracker.track("BAB"):
             Rts, f, _ = self.pose_initializer.initialize_bootstrap(self.bootstrap_desc_kpts)
             self.state.focal_px = float(f.detach().cpu().item())
+            self.keyframe_store.f = self.state.focal_px
+            self.anchor_scene_model.update_intrinsics(f)
 
-        for index, (keyframe_dict, desc_kpts, Rt) in enumerate(
-            zip(self.bootstrap_keyframe_dicts, self.bootstrap_desc_kpts, Rts)
+        created_keyframes = []
+        for index, (keyframe_dict, frame, desc_kpts, Rt) in enumerate(
+            zip(self.bootstrap_keyframe_dicts, self.bootstrap_frames, self.bootstrap_desc_kpts, Rts)
         ):
             with self.tracker.track("Add"):
                 focal = f
                 if self.args.use_colmap_poses:
                     Rt = keyframe_dict["info"]["Rt"]
                     focal = keyframe_dict["info"]["focal"]
-                keyframe = self._make_keyframe(
-                    keyframe_dict["image"], keyframe_dict["info"], desc_kpts, Rt, index, focal
-                )
-                self.scene_model.add_keyframe(keyframe, focal)
+                keyframe = self._make_keyframe(frame, Rt, index, focal)
+                created_keyframes.append((frame, keyframe))
 
-        if self.args.viewer_mode not in ["none", "web"]:
-            self.viewer.reset_intrinsics("point_view")
+        for frame, keyframe in created_keyframes:
+            self._calibrate_keyframe_depth_from_triangulation(keyframe)
+            self._attach_frame_to_controller(frame, keyframe)
 
         for index in range(self.args.num_keyframes_miniba_bootstrap):
-            with self.tracker.track("Init"):
-                self.scene_model.add_new_gaussians(index)
+            frame = self.bootstrap_frames[index]
+            keyframe = self.keyframe_store.keyframes[index]
+            self._optimize_anchor_scene(frame, keyframe, "anchor_bootstrap_opt")
 
         with self.tracker.track("Opt"):
             stats = self._optimize_scene("bootstrap_opt")
@@ -454,7 +498,7 @@ class ProgressiveTrainer:
                 self.loss_records,
                 stats,
                 phase="bootstrap_opt",
-                lod=self.scene_model.current_lod,
+                lod=self.current_lod,
                 step_idx=self.state.loss_step_idx,
             )
         self.state.last_reboot = self.state.n_keyframes
@@ -462,10 +506,10 @@ class ProgressiveTrainer:
     def _maybe_reboot(self) -> None:
         if (
             self.args.enable_reboot
-            and self.scene_model.approx_cam_centres is not None
-            and len(self.scene_model.anchors)
+            and self.keyframe_store.approx_cam_centres is not None
+            and len(self.keyframe_store.keyframes) >= 20
         ):
-            last_centers = self.scene_model.approx_cam_centres[-20:]
+            last_centers = self.keyframe_store.approx_cam_centres[-20:]
             rel_dist = torch.norm(last_centers[1:] - last_centers[:-1], dim=-1).mean()
             self.state.needs_reboot = (
                 rel_dist > 0.1 * 5 or rel_dist < 0.1 / 3
@@ -474,7 +518,7 @@ class ProgressiveTrainer:
         if not self.state.needs_reboot:
             return
 
-        bs_kfs = self.scene_model.keyframes[-8:]
+        bs_kfs = self.keyframe_store.recent(8)
         bootstrap_desc_kpts = [bs_kf.desc_kpts for bs_kf in bs_kfs]
         in_Rts = torch.stack([kf.get_Rt() for kf in bs_kfs])
         Rts, _, final_residual = self.pose_initializer.initialize_bootstrap(bootstrap_desc_kpts, rebooting=True)
@@ -482,24 +526,13 @@ class ProgressiveTrainer:
             Rts = align_mean_up_fwd(Rts, in_Rts)
             for Rt, keyframe in zip(Rts, bs_kfs):
                 keyframe.set_Rt(Rt)
-            self.scene_model.reset()
-            for i in range(3, 0, -1):
-                self.scene_model.add_new_gaussians(-i)
-            for _ in range(3 * self.args.num_iterations):
-                stats = self.scene_model.optimization_step()
-                self.state.loss_step_idx = _append_loss_record(
-                    self.loss_records,
-                    stats,
-                    phase="reboot_opt",
-                    lod=self.scene_model.current_lod,
-                    step_idx=self.state.loss_step_idx,
-                )
+            self.keyframe_store.refresh_after_pose_updates()
             self.state.needs_reboot = False
             self.state.last_reboot = self.state.n_keyframes
 
     def _register_incremental_keyframe(self, image, info: dict, desc_kpts) -> int:
         with self.tracker.track("tri"):
-            prev_keyframes = self.scene_model.get_prev_keyframes(
+            prev_keyframes = self.keyframe_store.get_prev_keyframes(
                 self.args.num_prev_keyframes_miniba_incr, True, desc_kpts
             )
         with self.tracker.track("BAI"):
@@ -509,7 +542,7 @@ class ProgressiveTrainer:
                 self.state.n_keyframes,
                 info["is_test"],
                 image,
-                all_keyframes=self.scene_model.keyframes,
+                all_keyframes=self.keyframe_store.keyframes,
                 retry_count=0,
                 frame_uid=info.get("frame_id"),
             )
@@ -527,17 +560,19 @@ class ProgressiveTrainer:
                 Rt = info["Rt"]
             focal_device = Rt.device if torch.is_tensor(Rt) else ("cuda" if torch.cuda.is_available() else "cpu")
             keyframe = self._make_keyframe(
-                image,
-                info,
-                desc_kpts,
+                self.frame_states.get(int(info.get("frame_id", index))),
                 Rt,
                 index,
                 torch.as_tensor(self.state.focal_px, device=focal_device),
             )
-            self.scene_model.add_keyframe(keyframe)
+            frame = self.frame_states.get(int(info.get("frame_id", index)))
+            if frame is not None:
+                self._calibrate_keyframe_depth_from_triangulation(keyframe)
+                self._attach_frame_to_controller(frame, keyframe)
 
-        with self.tracker.track("Init"):
-            self.scene_model.add_new_gaussians()
+        frame = self.frame_states.get(int(info.get("frame_id", index)))
+        if frame is not None:
+            self._optimize_anchor_scene(frame, keyframe, f"anchor_{phase}")
 
         with self.tracker.track("Opt"):
             stats = self._optimize_scene(phase)
@@ -545,7 +580,7 @@ class ProgressiveTrainer:
                 self.loss_records,
                 stats,
                 phase=phase,
-                lod=self.scene_model.current_lod,
+                lod=self.current_lod,
                 step_idx=self.state.loss_step_idx,
             )
 
@@ -566,6 +601,481 @@ class ProgressiveTrainer:
             else:
                 print(f"[PoseRetry] Queue full ({self.args.pose_retry_queue_size}), dropping frame {info.get('frame_id')}.")
 
+    def _optimize_anchor_scene(self, frame, keyframe: TrackingKeyframe, phase: str) -> None:
+        if self.cfg.anchor_iterations <= 0 or self.cfg.async_mapping:
+            return
+        anchor_id = int(frame.info.get("progressive_anchor_id", -1))
+        if anchor_id < 0 or anchor_id >= len(self.controller.anchors):
+            return
+        anchor = self.controller.anchors[anchor_id]
+        if anchor.gaussian_model.n == 0:
+            return
+        view_items = self._select_anchor_training_views(anchor, keyframe, frame)
+        with self.tracker.track("AnchorOpt"):
+            stats = self.anchor_scene_model.optimization_loop(
+                keyframe,
+                frame,
+                anchor_id=anchor_id,
+                n_iters=self.cfg.anchor_iterations,
+                view_items=view_items,
+            )
+        self.state.loss_step_idx = _append_loss_record(
+            self.loss_records,
+            stats,
+            phase=phase,
+            lod=self.current_lod,
+            step_idx=self.state.loss_step_idx,
+        )
+        status = self._anchor_budget_status(anchor, keyframe.get_centre(approx=True).detach())
+        if status["should_roll"] and anchor.anchor_id == self.controller.active_anchor().anchor_id:
+            self._seal_anchor_and_start_next(anchor, keyframe.get_centre(approx=True).detach(), self.prev_frame, frame, status)
+
+    def _anchor_budget_status(self, anchor, cam_centre: torch.Tensor | None = None) -> dict:
+        if anchor.anchor_id != self.controller.active_anchor().anchor_id:
+            return {"should_roll": False, "reasons": ["inactive_anchor"], "anchor_id": int(anchor.anchor_id)}
+        return self.controller.anchor_budget_status(
+            cam_centre,
+            max_anchor_radius=self.cfg.anchor_radius,
+            min_keyframes=self.cfg.anchor_min_keyframes,
+            max_gaussians=self.cfg.max_anchor_gaussians,
+            max_keyframes=self.cfg.max_anchor_keyframes,
+            max_tsdf_voxels=self.cfg.max_anchor_tsdf_voxels,
+            max_vram_mb=self.cfg.max_anchor_vram_mb,
+        )
+
+    def _seal_anchor_and_start_next(self, anchor, cam_centre: torch.Tensor, reference_frame, new_frame, status: dict) -> None:
+        if anchor.gaussian_model.n > 0 and self.cfg.anchor_final_iterations > 0 and len(anchor.keyframe_ids) > 0:
+            last_frame_id = int(anchor.keyframe_ids[-1])
+            last_keyframe = self.keyframe_store.by_frame_id(last_frame_id)
+            last_frame = self.frame_states.get(last_frame_id)
+            if last_keyframe is not None and last_frame is not None:
+                with self.tracker.track("AnchorFinalOpt"):
+                    self.anchor_scene_model.optimization_loop(
+                        last_keyframe,
+                        last_frame,
+                        anchor_id=anchor.anchor_id,
+                        n_iters=self.cfg.anchor_final_iterations,
+                        view_items=self._select_anchor_training_views(anchor, last_keyframe, last_frame),
+                    )
+        merge_stats = self.anchor_scene_model.merge_anchor_gaussians(
+            anchor,
+            voxel_size=self.cfg.anchor_merge_voxel_size,
+            target_max=self.cfg.anchor_merge_target_gaussians,
+        )
+        if self.args.model_path:
+            with self.tracker.track("AnchorSealSave"):
+                self.anchor_scene_model.save_anchor(self.args.model_path, anchor)
+        event = {
+            "anchor_id": int(anchor.anchor_id),
+            "reasons": list(status.get("reasons", [])),
+            "budget_status": status,
+            "merge": merge_stats,
+            "new_anchor_origin": cam_centre.detach().cpu().tolist(),
+        }
+        self.anchor_seal_events.append(event)
+        print(
+            "[AnchorSeal] "
+            f"anchor={anchor.anchor_id} reasons={event['reasons']} "
+            f"gaussians={status.get('num_gaussians', 0)} "
+            f"merge_after={merge_stats.get('after', anchor.gaussian_model.n)}"
+        )
+        self.controller.create_active_anchor(
+            torch.eye(3, device=cam_centre.device, dtype=cam_centre.dtype),
+            cam_centre,
+            reference_frame=reference_frame,
+            new_frame=new_frame,
+        )
+
+    def _attach_frame_to_controller(self, frame, keyframe: TrackingKeyframe) -> None:
+        cam_centre = keyframe.get_centre(approx=True).detach()
+        active_anchor = self.controller.active_anchor()
+        rolled_anchor = False
+        if len(active_anchor.keyframe_ids) == 0:
+            with self.controller.anchor_locks[active_anchor.anchor_id].write_lock():
+                active_anchor.t_anchor_to_world = cam_centre.to(active_anchor.device)
+                self.controller.graph.add_node(active_anchor.anchor_id, active_anchor.T_anchor_to_world)
+        else:
+            budget_status = self._anchor_budget_status(active_anchor, cam_centre)
+            if budget_status["should_roll"]:
+                self._seal_anchor_and_start_next(active_anchor, cam_centre, self.prev_frame, frame, budget_status)
+                active_anchor = self.controller.active_anchor()
+                rolled_anchor = True
+
+        self.controller.add_frame(frame, active_anchor)
+        frame.info["progressive_anchor_id"] = active_anchor.anchor_id
+        frame.info["progressive_keyframe_index"] = int(keyframe.index)
+        if self.place_index is not None:
+            self.place_index.add_keyframe(keyframe, active_anchor.anchor_id)
+        if rolled_anchor:
+            self._check_loop_closure(active_anchor.anchor_id)
+        self._check_frame_loop_closure(frame, active_anchor.anchor_id)
+        if self.cfg.async_mapping:
+            queued = self.controller.enqueue_mapping_task(frame, active_anchor.anchor_id)
+            if not queued:
+                self.controller.mapping_errors.append(f"mapping_queue_full:{frame.frame_id}")
+        else:
+            self._mapping_step(MappingTask(frame=frame, anchor_id=active_anchor.anchor_id))
+
+    def _check_loop_closure(self, new_anchor_id: int) -> None:
+        if self.loop_manager is None:
+            return
+
+        def matcher_fn(left, right):
+            return self.observation_builder.match(left, right, remove_outliers=False)
+
+        results = self.loop_manager.check_anchor_rollover(
+            new_anchor_id,
+            self.keyframe_store,
+            self.controller,
+            matcher_fn,
+        )
+        for result in results:
+            status = "accepted" if result.accepted else result.reason
+            print(
+                "[LoopClosure] "
+                f"anchor={new_anchor_id} status={status} "
+                f"matches={result.num_matches} inlier={result.inlier_ratio:.3f}"
+            )
+
+    def _promote_loop_candidate_keyframe(self, frame) -> bool:
+        if self.place_index is None or self.loop_manager is None or self.controller is None:
+            return False
+        if len(self.controller.anchors) < 3:
+            return False
+        active_anchor_id = int(self.controller.active_anchor().anchor_id)
+        candidates = self.place_index.query_frame(
+            frame,
+            current_anchor_id=active_anchor_id,
+            exclude_anchor_window=self.cfg.loop_min_anchor_gap,
+            top_k=self.cfg.loop_check_max_candidates,
+        )
+        if len(candidates) == 0:
+            return False
+
+        def matcher_fn(left, right):
+            return self.observation_builder.match(left, right, remove_outliers=False)
+
+        accepted_candidates = []
+        for candidate in candidates:
+            dst_keyframe = self.keyframe_store.by_index(candidate.keyframe_index)
+            if dst_keyframe is None:
+                continue
+            result = self.controller.loop_verifier.verify(frame, dst_keyframe.frame, matcher_fn)
+            if result.accepted:
+                accepted_candidates.append(candidate)
+                frame.info["progressive_loop_hint"] = {
+                    "candidate_anchor_id": int(candidate.anchor_id),
+                    "candidate_keyframe_index": int(candidate.keyframe_index),
+                    "retrieval_score": float(candidate.score),
+                    "retrieval_threshold": float(candidate.threshold),
+                    "num_matches": int(result.num_matches),
+                    "inlier_ratio": float(result.inlier_ratio),
+                }
+                break
+        if len(accepted_candidates) == 0:
+            return False
+        frame.info["progressive_loop_candidates"] = accepted_candidates
+        return True
+
+    def _check_frame_loop_closure(self, frame, active_anchor_id: int) -> None:
+        if self.loop_manager is None:
+            return
+        candidates = frame.info.get("progressive_loop_candidates", [])
+        if len(candidates) == 0:
+            return
+
+        def matcher_fn(left, right):
+            return self.observation_builder.match(left, right, remove_outliers=False)
+
+        results = self.loop_manager.check_frame_candidates(
+            active_anchor_id,
+            frame,
+            candidates,
+            self.keyframe_store,
+            self.controller,
+            matcher_fn,
+        )
+        for result in results:
+            status = "accepted" if result.accepted else result.reason
+            print(
+                "[LoopClosureFrame] "
+                f"anchor={active_anchor_id} status={status} "
+                f"dst={result.dst_anchor_id} matches={result.num_matches} "
+                f"inlier={result.inlier_ratio:.3f}"
+            )
+
+    @torch.no_grad()
+    def _mapping_step(self, task: MappingTask) -> None:
+        anchor = self.controller.anchors[int(task.anchor_id)]
+        frame = task.frame
+        keyframe_index = int(frame.info.get("progressive_keyframe_index", -1))
+        keyframe = self.keyframe_store.by_index(keyframe_index)
+        if keyframe is None:
+            return
+        calibrated_depth = bool(frame.info.get("mono_depth_calibrated", False))
+        Rt = keyframe.get_Rt().detach()
+        R_w2c = Rt[:3, :3]
+        t_w2c = Rt[:3, 3]
+        R_cam_to_world = R_w2c.T
+        t_cam_to_world = -R_w2c.T @ t_w2c
+        rendered_image = None
+        rendered_invdepth = None
+        if anchor.gaussian_model.n > 0:
+            with self.controller.anchor_locks[anchor.anchor_id].read_lock():
+                result = self.anchor_scene_model.render_from_keyframe(keyframe, active_anchor_ids=[anchor.anchor_id])
+                if not result.cuda_error:
+                    rendered_image = result.render.detach()
+                    rendered_invdepth = result.invdepth.detach()
+        with self.controller.anchor_locks[anchor.anchor_id].write_lock():
+            self._spawn_triangulated_keypoint_gaussians(anchor, keyframe, R_cam_to_world, t_cam_to_world)
+            if calibrated_depth or not self.cfg.require_calibrated_depth:
+                self.tsdf_fusion.integrate_depth(
+                    anchor.tsdf,
+                    frame.mono_idepth,
+                    frame.mono_depth_conf,
+                    anchor.R_world_to_anchor,
+                    anchor.t_world_to_anchor,
+                    R_cam_to_world,
+                    t_cam_to_world,
+                    self.keyframe_store.f,
+                    self.keyframe_store.centre,
+                )
+                self._spawn_anchor_local_gaussians(
+                    anchor,
+                    frame,
+                    R_cam_to_world,
+                    t_cam_to_world,
+                    rendered_image=rendered_image,
+                    rendered_invdepth=rendered_invdepth,
+                )
+            else:
+                self.controller.mapping_errors.append(f"uncalibrated_dense_depth_skip:{frame.frame_id}")
+        self._maybe_anchor_render_check(frame, anchor)
+
+    @torch.no_grad()
+    def _spawn_triangulated_keypoint_gaussians(
+        self,
+        anchor,
+        keyframe: TrackingKeyframe,
+        R_cam_to_world: torch.Tensor,
+        t_cam_to_world: torch.Tensor,
+    ) -> None:
+        desc = keyframe.desc_kpts
+        valid = desc.has_pt3d & torch.isfinite(desc.pts3d).all(dim=-1) & torch.isfinite(desc.depth) & (desc.depth > 1e-6)
+        if not valid.any():
+            return
+        valid_idx = torch.nonzero(valid, as_tuple=False).flatten()
+        max_sparse = min(int(self.cfg.local_spawn_max), 2048)
+        if valid_idx.shape[0] > max_sparse:
+            conf = desc.pts_conf[valid_idx].float()
+            conf = torch.where(torch.isfinite(conf), conf, torch.zeros_like(conf))
+            valid_idx = valid_idx[torch.topk(conf, k=max_sparse, largest=True).indices]
+        xyz_cam = desc.pts3d[valid_idx].to(keyframe.device)
+        uv = desc.kpts[valid_idx].to(keyframe.device)
+        depth = desc.depth[valid_idx].to(keyframe.device).clamp_min(1e-6)
+        xyz_world = (R_cam_to_world @ xyz_cam.T).T + t_cam_to_world[None]
+        xyz_local = anchor.world_to_local(xyz_world)
+        finite = torch.isfinite(xyz_local).all(dim=-1) & (depth > 1e-6)
+        if not finite.any():
+            return
+        xyz_local = xyz_local[finite]
+        uv = uv[finite]
+        depth = depth[finite]
+        sampler = make_torch_sampler(uv.view(1, 1, -1, 2), keyframe.width, keyframe.height)
+        colors = torch.nn.functional.grid_sample(
+            keyframe.frame.image[None].to(keyframe.device),
+            sampler,
+            mode="bilinear",
+            align_corners=True,
+        )[0, :, 0, :].T.contiguous()
+        n_new = xyz_local.shape[0]
+        rest_dim = anchor.gaussian_model.params["f_rest"]["val"].shape[1]
+        scale = (depth / float(self.keyframe_store.f)).clamp(1e-5, 1.0)
+        extension = {
+            "xyz": xyz_local.contiguous(),
+            "f_dc": RGB2SH(colors[:, None, :]).contiguous(),
+            "f_rest": torch.zeros(n_new, rest_dim, 3, device=xyz_local.device),
+            "opacity": inverse_sigmoid(torch.full((n_new, 1), self.cfg.spawn_opacity_init, device=xyz_local.device)),
+            "scaling": torch.log(scale).unsqueeze(-1).repeat(1, 3).contiguous(),
+            "rotation": torch.zeros(n_new, 4, device=xyz_local.device),
+        }
+        extension["rotation"][:, 0] = 1
+        anchor.gaussian_model.append(extension, anchor.anchor_id)
+
+    @torch.no_grad()
+    def _spawn_anchor_local_gaussians(
+        self,
+        anchor,
+        frame,
+        R_cam_to_world: torch.Tensor,
+        t_cam_to_world: torch.Tensor,
+        rendered_image: torch.Tensor | None = None,
+        rendered_invdepth: torch.Tensor | None = None,
+    ) -> None:
+        if frame.info.get("is_test", False):
+            return
+        if self.spawn_policy is None:
+            self.spawn_policy = GaussianSpawnPolicy(
+                width=self.width,
+                height=self.height,
+                f=self.keyframe_store.f,
+                centre=self.keyframe_store.centre,
+                init_proba_scaler=self.args.init_proba_scaler,
+                target_samples=self.cfg.local_spawn_target,
+                surface_sample_floor=self.cfg.surface_sample_floor,
+                low_frequency_fraction=self.cfg.low_frequency_spawn_fraction,
+                edge_probability_threshold=self.cfg.edge_probability_threshold,
+            )
+        spawn = self.spawn_policy.sample(
+            frame,
+            rendered_image=rendered_image,
+            rendered_invdepth=rendered_invdepth,
+        )
+        if spawn.xyz_cam.shape[0] == 0:
+            return
+        if spawn.xyz_cam.shape[0] > self.cfg.local_spawn_max:
+            keep = torch.randperm(spawn.xyz_cam.shape[0], device=spawn.xyz_cam.device)[: self.cfg.local_spawn_max]
+            xyz_cam = spawn.xyz_cam[keep]
+            f_dc = spawn.f_dc[keep]
+            depth = spawn.depth[keep]
+            uv = spawn.uv[keep]
+            sample_probability = spawn.init_probability[keep]
+        else:
+            xyz_cam = spawn.xyz_cam
+            f_dc = spawn.f_dc
+            depth = spawn.depth
+            uv = spawn.uv
+            sample_probability = spawn.init_probability
+        xyz_world = (R_cam_to_world @ xyz_cam.T).T + t_cam_to_world[None]
+        xyz_local = anchor.world_to_local(xyz_world)
+        n_new = xyz_local.shape[0]
+        rest_dim = anchor.gaussian_model.params["f_rest"]["val"].shape[1]
+        scale = (depth / (float(self.keyframe_store.f) * torch.sqrt(sample_probability.clamp_min(1e-3)))).clamp(1e-6, 1e6)
+        extension = {
+            "xyz": xyz_local.contiguous(),
+            "f_dc": f_dc.contiguous(),
+            "f_rest": torch.zeros(n_new, rest_dim, 3, device=xyz_local.device),
+            "opacity": inverse_sigmoid(torch.full((n_new, 1), self.cfg.spawn_opacity_init, device=xyz_local.device)),
+            "scaling": torch.log(scale).unsqueeze(-1).repeat(1, 3).contiguous(),
+            "rotation": torch.zeros(n_new, 4, device=xyz_local.device),
+        }
+        extension["rotation"][:, 0] = 1
+        finite = torch.ones(n_new, dtype=torch.bool, device=xyz_local.device)
+        for tensor in extension.values():
+            finite &= torch.isfinite(tensor.flatten(1)).all(dim=1)
+        if finite.any():
+            anchor.gaussian_model.append({key: value[finite].contiguous() for key, value in extension.items()}, anchor.anchor_id)
+        self.anchor_scene_model.last_render_debug["last_spawn"] = self._spawn_diagnostics(
+            anchor,
+            spawn,
+            uv,
+            depth,
+            xyz_world,
+            xyz_local,
+            finite,
+            R_cam_to_world,
+            t_cam_to_world,
+        )
+
+    @torch.no_grad()
+    def _spawn_diagnostics(
+        self,
+        anchor,
+        spawn,
+        uv: torch.Tensor,
+        depth: torch.Tensor,
+        xyz_world: torch.Tensor,
+        xyz_local: torch.Tensor,
+        finite: torch.Tensor,
+        R_cam_to_world: torch.Tensor,
+        t_cam_to_world: torch.Tensor,
+    ) -> dict:
+        stats = dict(getattr(spawn, "stats", {}))
+        stats["kept_after_cap"] = int(uv.shape[0])
+        stats["finite_after_transform"] = int(finite.sum().item()) if finite.numel() else 0
+        diag_mask = finite & torch.isfinite(xyz_world).all(dim=1) & torch.isfinite(xyz_local).all(dim=1)
+        if uv.numel() == 0 or not diag_mask.any():
+            return stats
+        uv = uv[diag_mask]
+        xyz_world = xyz_world[diag_mask]
+        xyz_local = xyz_local[diag_mask]
+        xyz_cam_check = ((xyz_world - t_cam_to_world[None]) @ R_cam_to_world).contiguous()
+        uv_reprojected = pts2px(xyz_cam_check, self.keyframe_store.f, self.keyframe_store.centre.to(xyz_cam_check.device))
+        reproj_error = torch.linalg.vector_norm(uv_reprojected - uv.to(uv_reprojected.device), dim=-1)
+        query = anchor.tsdf.query(xyz_local)
+        valid_tsdf = query.valid & (query.weight > 0)
+        stats.update(
+            {
+                "reprojection_error_mean_px": float(reproj_error.mean().detach().item()),
+                "reprojection_error_p95_px": float(torch.quantile(reproj_error.float(), 0.95).detach().item()),
+                "tsdf_valid_ratio": float(valid_tsdf.float().mean().detach().item()) if valid_tsdf.numel() else 0.0,
+                "tsdf_weight_mean": float(query.weight[valid_tsdf].mean().detach().item()) if valid_tsdf.any() else 0.0,
+                "tsdf_abs_mean": float(query.tsdf[valid_tsdf].abs().mean().detach().item()) if valid_tsdf.any() else 0.0,
+                "camera_depth_min": float(xyz_cam_check[:, 2].min().detach().item()),
+                "camera_depth_median": float(xyz_cam_check[:, 2].median().detach().item()),
+                "camera_depth_max": float(xyz_cam_check[:, 2].max().detach().item()),
+                "local_bbox_min": xyz_local.min(dim=0).values.detach().cpu().tolist(),
+                "local_bbox_max": xyz_local.max(dim=0).values.detach().cpu().tolist(),
+            }
+        )
+        return stats
+
+    def _select_anchor_training_views(self, anchor, current_keyframe: TrackingKeyframe, current_frame) -> list[tuple[TrackingKeyframe, object]]:
+        max_views = max(1, int(self.cfg.anchor_train_views))
+        selected: list[tuple[TrackingKeyframe, object]] = [(current_keyframe, current_frame)]
+        seen = {int(current_keyframe.frame.frame_id)}
+        for frame_id in reversed(anchor.keyframe_ids):
+            if len(selected) >= max_views:
+                break
+            frame_id = int(frame_id)
+            if frame_id in seen:
+                continue
+            keyframe = self.keyframe_store.by_frame_id(frame_id)
+            frame = self.frame_states.get(frame_id)
+            if keyframe is None or frame is None:
+                continue
+            selected.append((keyframe, frame))
+            seen.add(frame_id)
+        return selected
+
+    @torch.no_grad()
+    def _maybe_anchor_render_check(self, frame, anchor) -> None:
+        if self.cfg.anchor_render_check_every <= 0:
+            return
+        if len(anchor.keyframe_ids) % self.cfg.anchor_render_check_every != 0:
+            return
+        keyframe_index = int(frame.info.get("progressive_keyframe_index", -1))
+        keyframe = self.keyframe_store.by_index(keyframe_index)
+        if keyframe is None:
+            return
+        with self.tracker.track("AnchorRender"):
+            result = self.anchor_scene_model.render_from_keyframe(keyframe, active_anchor_ids=[anchor.anchor_id])
+        debug = self.anchor_scene_model.last_render_debug
+        if result.cuda_error:
+            self.controller.mapping_errors.append(f"anchor_render_cuda:{frame.frame_id}:{result.cuda_error}")
+        if debug:
+            spawn_debug = debug.get("last_spawn", {})
+            print(
+                "[AnchorRender] "
+                f"frame={frame.frame_id} anchor={anchor.anchor_id} "
+                f"input={debug.get('num_input_gaussians', 0)} "
+                f"visible={debug.get('num_visible_gaussians', 0)} "
+                f"radii_pos={debug.get('num_positive_radii', 0)} "
+                f"raster_limited={debug.get('num_raster_limited', 0)} "
+                f"guard={debug.get('guard_reason_counts', {})}"
+            )
+            if spawn_debug:
+                print(
+                    "[GaussianSpawn] "
+                    f"frame={frame.frame_id} anchor={anchor.anchor_id} "
+                    f"spawned={spawn_debug.get('spawned', 0)} "
+                    f"kept={spawn_debug.get('kept_after_cap', 0)} "
+                    f"finite={spawn_debug.get('finite_after_transform', 0)} "
+                    f"tsdf_valid={spawn_debug.get('tsdf_valid_ratio', 0.0):.3f} "
+                    f"reproj_p95={spawn_debug.get('reprojection_error_p95_px', 0.0):.3f}px "
+                    f"depth_med={spawn_debug.get('camera_depth_median', 0.0):.3f}"
+                )
+
     def _retry_pending_keyframes(self) -> int:
         extra_registered = 0
         retries = min(self.args.pose_retry_per_success, len(self.pending_pose_queue))
@@ -573,7 +1083,7 @@ class ProgressiveTrainer:
             pending = self.pending_pose_queue.popleft()
             retry_index = self.state.n_keyframes + 1 + extra_registered
             with self.tracker.track("tri_retry"):
-                retry_prev_keyframes = self.scene_model.get_prev_keyframes(
+                retry_prev_keyframes = self.keyframe_store.get_prev_keyframes(
                     self.args.num_prev_keyframes_miniba_incr, True, pending["desc_kpts"]
                 )
             with self.tracker.track("BAI_retry"):
@@ -583,7 +1093,7 @@ class ProgressiveTrainer:
                     retry_index,
                     pending["info"]["is_test"],
                     pending["image"],
-                    all_keyframes=self.scene_model.keyframes,
+                    all_keyframes=self.keyframe_store.keyframes,
                     retry_count=pending["retry_count"],
                     frame_uid=pending["info"].get("frame_id", retry_index),
                 )
@@ -597,8 +1107,6 @@ class ProgressiveTrainer:
                     retry_index,
                     "incremental_retry_opt",
                 )
-                with self.tracker.track("anc_retry"):
-                    self.scene_model.place_anchor_if_needed()
                 extra_registered += 1
             elif (
                 self.pose_initializer.last_failure_reason == "lsf_velocity_gate"
@@ -609,36 +1117,106 @@ class ProgressiveTrainer:
                 self.pending_pose_queue.append(pending)
         return extra_registered
 
-    def _make_keyframe(self, image, info: dict, desc_kpts, Rt, index: int, focal):
-        return Keyframe(
-            image,
-            info,
-            desc_kpts,
-            Rt,
-            index,
-            focal,
-            self.dense_extractor,
-            self.depth_estimator,
-            self.triangulator,
-            self.args,
+    @torch.no_grad()
+    def _calibrate_keyframe_depth_from_triangulation(self, keyframe: TrackingKeyframe) -> None:
+        keyframe.update_3dpts(self.keyframe_store.keyframes)
+        desc = keyframe.desc_kpts
+        valid = desc.has_pt3d & torch.isfinite(desc.depth) & (desc.depth > 1e-6) & (desc.pts_conf > 0)
+        stats = {
+            "method": "triangulated_keypoint_median_inverse_depth_scale",
+            "num_candidates": int(valid.sum().item()),
+            "required": int(self.cfg.depth_scale_min_samples),
+            "calibrated": False,
+        }
+        if int(valid.sum().item()) < int(self.cfg.depth_scale_min_samples):
+            keyframe.frame.info["mono_depth_alignment"] = stats
+            keyframe.frame.info["mono_depth_calibrated"] = False
+            return
+
+        uv = desc.kpts[valid].to(keyframe.device)
+        sampler = make_torch_sampler(uv.view(1, 1, -1, 2), keyframe.width, keyframe.height)
+        mono = torch.nn.functional.grid_sample(
+            keyframe.mono_idepth,
+            sampler,
+            mode="bilinear",
+            align_corners=True,
+        )[0, 0, 0]
+        mono_conf = torch.nn.functional.grid_sample(
+            keyframe.mono_depth_conf,
+            sampler,
+            mode="bilinear",
+            align_corners=True,
+        )[0, 0, 0]
+        target_idepth = 1.0 / desc.depth[valid].to(keyframe.device).clamp_min(1e-6)
+        ratios = target_idepth / mono.clamp_min(1e-6)
+        ratio_valid = (
+            torch.isfinite(ratios)
+            & (ratios > 0)
+            & torch.isfinite(mono_conf)
+            & (mono_conf >= self.cfg.scale.min_conf)
         )
+        if int(ratio_valid.sum().item()) < int(self.cfg.depth_scale_min_samples):
+            stats["num_valid_ratios"] = int(ratio_valid.sum().item())
+            keyframe.frame.info["mono_depth_alignment"] = stats
+            keyframe.frame.info["mono_depth_calibrated"] = False
+            return
+
+        ratios = ratios[ratio_valid].float()
+        q10 = torch.quantile(ratios, 0.10)
+        q90 = torch.quantile(ratios, 0.90)
+        robust = ratios[(ratios >= q10) & (ratios <= q90)]
+        if robust.numel() == 0:
+            robust = ratios
+        scale = robust.median().clamp(
+            min=float(self.cfg.min_depth_scale),
+            max=float(self.cfg.max_depth_scale),
+        )
+        keyframe.apply_mono_idepth_calibration(scale)
+        stats.update(
+            {
+                "calibrated": True,
+                "num_valid_ratios": int(ratios.numel()),
+                "num_robust_ratios": int(robust.numel()),
+                "scale": float(scale.detach().item()),
+                "ratio_q10": float(q10.detach().item()),
+                "ratio_q90": float(q90.detach().item()),
+            }
+        )
+        keyframe.frame.info["mono_depth_alignment"] = stats
+        keyframe.frame.info["mono_depth_calibrated"] = True
+
+    def _make_keyframe(self, frame, Rt, index: int, focal) -> TrackingKeyframe:
+        if frame is None:
+            raise RuntimeError(f"Missing FrameState for keyframe index {index}")
+        focal = self._focal_tensor(focal, Rt)
+        keyframe = self.keyframe_store.add_keyframe(frame, Rt, focal, index)
+        self.state.focal_px = float(keyframe.f.detach().cpu().item())
+        return keyframe
+
+    @staticmethod
+    def _focal_tensor(focal, Rt=None) -> torch.Tensor:
+        if torch.is_tensor(focal):
+            f = focal.detach().clone() if not focal.requires_grad else focal
+        else:
+            device = Rt.device if torch.is_tensor(Rt) else ("cuda" if torch.cuda.is_available() else "cpu")
+            f = torch.tensor([float(focal)], device=device)
+        if f.ndim == 0:
+            f = f.reshape(1)
+        else:
+            f = f.flatten()[:1]
+        return f.contiguous()
 
     def _optimize_scene(self, phase: str) -> dict | None:
-        if self.is_stream:
-            self.scene_model.optimize_async(self.args.num_iterations)
-            return None
-        return self.scene_model.optimization_loop(self.args.num_iterations)
+        del phase
+        return None
 
     def _evaluate_and_checkpoint(self, frame_id: int) -> None:
-        if (
-            self.state.n_keyframes % self.args.test_frequency == 0
-            and self.args.test_frequency > 0
-            and (self.args.test_hold > 0 or self.args.eval_poses)
-        ):
-            self.metrics = self.scene_model.evaluate(self.args.eval_poses)
-
         if frame_id % self.args.save_every == 0 and self.args.save_every > 0:
-            self.scene_model.save(os.path.join(self.args.model_path, "progress", f"{frame_id:05d}"))
+            self.anchor_scene_model.save(
+                os.path.join(self.args.model_path, "progress", f"{frame_id:05d}"),
+                self.keyframe_store.keyframes,
+                n_frames=len(self.dataset),
+            )
 
     def _update_progress_bar(self, pbar) -> None:
         bar_postfix = []
@@ -651,15 +1229,22 @@ class ProgressiveTrainer:
         bar_postfix += [
             f"\033[36mFocal:{self.state.focal_px:.1f}",
             f"\033[36mKeyframes:{self.state.n_keyframes}\033[0m",
-            f"\033[36mGaussians:{self.scene_model.n_active_gaussians}\033[0m",
-            f"\033[36mAnchors:{len(self.scene_model.anchors)}\033[0m",
+            f"\033[36mGaussians:{self.anchor_scene_model.state_summary()['num_gaussians']}\033[0m",
+            f"\033[36mAnchors:{len(self.controller.anchors)}\033[0m",
         ]
         pbar.set_postfix_str(",".join(bar_postfix), refresh=False)
 
     def _finalize(self, reconstruction_time: float) -> dict:
-        self.scene_model.enable_inference_mode()
+        if self.cfg.async_mapping:
+            self.controller.mapping_queue.join()
+            self.controller.stop_mapping_worker()
         print("Saving the Progressive reconstruction to:", self.args.model_path)
-        metrics = self.scene_model.save(self.args.model_path, reconstruction_time, len(self.dataset))
+        metrics = self.anchor_scene_model.save(
+            self.args.model_path,
+            self.keyframe_store.keyframes,
+            reconstruction_time,
+            len(self.dataset),
+        )
         print(
             ", ".join(
                 f"{metric}: {value:.3f}" if isinstance(value, float) else f"{metric}: {value}"
@@ -668,134 +1253,27 @@ class ProgressiveTrainer:
         )
         self.pose_initializer.save_failure_log(self.args.model_path)
 
-        reconstruction_time = self._run_lod_finetune(reconstruction_time, metrics)
-        self.scene_model.inference_mode = True
         self.tracker.print_stats()
         self.tracker.save_stats(os.path.join(self.args.model_path, "resource_stats.txt"))
         _save_loss_records_and_plot(self.loss_records, self.args.model_path)
-
-        if self.args.viewer_mode != "none":
-            self._keep_viewer_alive()
+        lod_gate = {
+            "ready": True,
+            "reason": "progressive_anchor_local_single_lod",
+            "pose_stability": 1.0,
+            "projection_error_mean": 0.0,
+        }
+        _save_lod_completion_marker(self.args.model_path, self.current_lod, reconstruction_time, lod_gate, metrics)
 
         return {
             "num_keyframes": self.state.n_keyframes,
-            "num_anchors": len(self.scene_model.anchors),
+            "num_anchors": len(self.controller.anchors),
+            "pipeline_state": self.controller.state_summary(),
+            "anchor_scene_state": self.anchor_scene_model.state_summary(),
+            "anchor_seal_events": list(self.anchor_seal_events),
+            "loop_closure": self.loop_manager.summary() if self.loop_manager is not None else {},
             "num_loss_records": len(self.loss_records),
             "reconstruction_time": reconstruction_time,
         }
-
-    def _run_lod_finetune(self, reconstruction_time: float, metrics: dict) -> float:
-        finetune_epochs_per_level = 0
-        if len(self.args.save_at_finetune_epoch) > 0:
-            finetune_epochs_per_level = max(self.args.save_at_finetune_epoch)
-        elif self.args.lod_max > self.args.lod_min:
-            finetune_epochs_per_level = 10
-
-        current_lod_step = self.scene_model.current_lod
-        while current_lod_step <= self.args.lod_max:
-            if finetune_epochs_per_level > 0:
-                print(f"\n--- Progressive Training LoD {current_lod_step} ---")
-                torch.cuda.empty_cache()
-                self.scene_model.inference_mode = False
-                pbar = tqdm(range(0, finetune_epochs_per_level), desc=f"Fine tuning LoD {current_lod_step}")
-                for epoch in pbar:
-                    epoch_start_time = time.time()
-                    with self.tracker.track(f"LoD_{current_lod_step}"):
-                        stats = self.scene_model.finetune_epoch()
-                        self.state.loss_step_idx = _append_loss_record(
-                            self.loss_records,
-                            stats,
-                            phase=f"finetune_lod_{current_lod_step}",
-                            lod=current_lod_step,
-                            step_idx=self.state.loss_step_idx,
-                        )
-                    reconstruction_time += time.time() - epoch_start_time
-                    if epoch + 1 in self.args.save_at_finetune_epoch:
-                        torch.cuda.empty_cache()
-                        self.scene_model.inference_mode = True
-                        metrics = self.scene_model.save(
-                            os.path.join(self.args.model_path, f"lod_{current_lod_step}_epoch_{epoch + 1}"),
-                            reconstruction_time,
-                        )
-                        pbar.set_postfix_str(",".join(self._format_metric(k, v) for k, v in metrics.items()))
-                        self.scene_model.inference_mode = False
-                        torch.cuda.empty_cache()
-
-            lod_gate = lod_progressive_ready(
-                self.scene_model,
-                min_pose_stability=self.args.lod_min_pose_stability,
-                max_projection_error_px=self.args.lod_max_projection_error_px,
-                pose_window=self.args.lod_pose_window,
-            )
-            print(
-                f"[LoD Gate] L{current_lod_step}: ready={lod_gate['ready']} "
-                f"pose={lod_gate['pose_stability']:.3f}, proj_mean={lod_gate['projection_error_mean']:.3f}px"
-            )
-
-            extra_epochs = 0
-            while (
-                current_lod_step < self.args.lod_max
-                and not lod_gate["ready"]
-                and extra_epochs < self.args.lod_progressive_max_extra_epochs
-            ):
-                extra_epochs += 1
-                self.scene_model.inference_mode = False
-                epoch_start_time = time.time()
-                with self.tracker.track(f"LoD_{current_lod_step}_extra"):
-                    stats = self.scene_model.finetune_epoch()
-                    self.state.loss_step_idx = _append_loss_record(
-                        self.loss_records,
-                        stats,
-                        phase=f"finetune_lod_{current_lod_step}_extra",
-                        lod=current_lod_step,
-                        step_idx=self.state.loss_step_idx,
-                    )
-                reconstruction_time += time.time() - epoch_start_time
-                lod_gate = lod_progressive_ready(
-                    self.scene_model,
-                    min_pose_stability=self.args.lod_min_pose_stability,
-                    max_projection_error_px=self.args.lod_max_projection_error_px,
-                    pose_window=self.args.lod_pose_window,
-                )
-                print(
-                    f"[LoD Gate][extra {extra_epochs}/{self.args.lod_progressive_max_extra_epochs}] "
-                    f"ready={lod_gate['ready']} pose={lod_gate['pose_stability']:.3f}, "
-                    f"proj_mean={lod_gate['projection_error_mean']:.3f}px"
-                )
-
-            save_dir = self._lod_save_dir(current_lod_step)
-            self.scene_model.inference_mode = True
-            print(f"Saving LoD {current_lod_step} completion checkpoint to {save_dir}")
-            if self.args.lod_min == self.args.lod_max:
-                marker_path = _save_lod_completion_marker(save_dir, current_lod_step, reconstruction_time, lod_gate, metrics)
-                print(f"Single-LoD checkpoint reuses the initial full scene save; completion marker written to {marker_path}")
-            else:
-                self.scene_model.save(save_dir, reconstruction_time)
-                _save_lod_completion_marker(save_dir, current_lod_step, reconstruction_time, lod_gate, metrics)
-            self.scene_model.inference_mode = False
-
-            if current_lod_step < self.args.lod_max:
-                if not lod_gate["ready"]:
-                    print(
-                        f"[LoD Gate] Max extra epochs reached at LoD {current_lod_step} "
-                        f"(reason={lod_gate['reason']}). Progressing to next LoD."
-                    )
-                print(f"Increasing LoD from {current_lod_step} to {current_lod_step + 1}")
-                with self.tracker.track(f"IncLoD_{current_lod_step}"):
-                    self.scene_model.increase_lod()
-                current_lod_step = self.scene_model.current_lod
-            else:
-                break
-
-        return reconstruction_time
-
-    def _lod_save_dir(self, current_lod_step: int) -> str:
-        if self.args.lod_min == self.args.lod_max:
-            return self.args.model_path
-        base_parent = os.path.dirname(os.path.normpath(self.args.model_path))
-        base_name = os.path.basename(os.path.normpath(self.args.model_path))
-        lod_tag = f"LoD-{self.args.lod_min}-{current_lod_step}-{self.args.lod_max}"
-        return os.path.join(base_parent, f"{base_name}_{lod_tag}")
 
     @staticmethod
     def _format_metric(key: str, value) -> str:
@@ -803,23 +1281,14 @@ class ProgressiveTrainer:
             return f"\033[31m{key}:{value:.2f}\033[0m"
         return f"\033[31m{key}:{value}\033[0m"
 
-    def _keep_viewer_alive(self) -> None:
-        if self.args.viewer_mode == "web":
-            while True:
-                time.sleep(1)
-        self.viewer.throttling = False
-        while self.viewer.running:
-            time.sleep(1)
-
-
 def main() -> None:
     torch.random.manual_seed(0)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(0)
     np.random.seed(0)
 
-    cfg, clean_argv = _parse_progressive_args(sys.argv)
-    args = _parse_training_args(clean_argv)
+    args, _ = _parse_progressive_args(sys.argv)
+    cfg = args
     started_at = time.time()
     try:
         summary = ProgressiveTrainer(args, cfg).run()
