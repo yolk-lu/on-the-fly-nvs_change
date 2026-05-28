@@ -65,6 +65,9 @@ class PoseConfig:
     pose_vel_angle_max_deg: float = 25.0
     pose_lsf_force_accept_after: int = 0
     pose_retry_rescue_when_full: bool = False
+    relocalization_top_k: int = 16
+    relocalization_min_triangulated: int = 4
+    relocalization_max_keyframes: int = 6
 
 
 @dataclass
@@ -72,10 +75,11 @@ class AnchorConfig:
     sh_degree: int = 3
     anchor_radius: float = 5.0
     anchor_min_keyframes: int = 20
+    anchor_origin_median_window: int = 5
     max_active_keyframes: int = 200
     max_anchor_gaussians: int = 250_000
     max_anchor_keyframes: int = 80
-    max_anchor_tsdf_voxels: int = 250_000
+    max_anchor_tsdf_voxels: int = 0
     max_anchor_vram_mb: float = 0.0
     anchor_final_iterations: int = 5
     anchor_merge_voxel_size: float = 0.05
@@ -87,7 +91,15 @@ class AnchorConfig:
     low_frequency_spawn_fraction: float = 0.15
     edge_probability_threshold: float = 0.02
     spawn_opacity_init: float = 0.06
-    max_rasterized_gaussians: int = 60_000
+    mvs_depth_consistency_idepth: float = 0.25
+    mvs_mono_fallback_fraction: float = 0.25
+    mvs_mono_fallback_max_fraction: float = 0.50
+    mvs_target_ratio: float = 0.35
+    mono_fallback_min_points: int = 2048
+    tsdf_fusion_mode: str = "disabled"
+    delayed_tsdf_min_opacity: float = 0.05
+    delayed_tsdf_max_samples: int = 250_000
+    max_rasterized_gaussians: int = 30_000
     anchor_render_check_every: int = 25
     anchor_iterations: int = 20
     anchor_train_views: int = 4
@@ -104,7 +116,7 @@ class LossConfig:
     depth_loss_weight_init: float = 3e-2
     depth_loss_weight_decay: float = 0.9
     depth_valid_epsilon: float = 1e-6
-    tsdf_loss_weight: float = 5e-3
+    tsdf_loss_weight: float = 0.0
     anisotropy_loss_weight: float = 1e-4
     max_gaussian_aspect_ratio: float = 8.0
     rgb_visible_weight: float = 0.85
@@ -145,6 +157,9 @@ class OutputConfig:
     run_label: str = "progressive_train"
     lod_min: int = 1
     lod_max: int = 1
+    save_test_renders: bool = True
+    test_render_every: int = 1
+    test_render_dir: str = "test_renders"
 
 
 @dataclass
@@ -153,7 +168,7 @@ class ScaleConfig:
     min_conf: float = 0.35
     grid_size: int = 16
     min_samples_per_cell: int = 8
-    min_triangulated_samples: int = 16
+    min_triangulated_samples: int = 3
     min_depth_scale: float = 1e-3
     max_depth_scale: float = 1e3
     require_calibrated_depth: bool = True
@@ -193,6 +208,7 @@ class ProgressiveConfig:
         self.progressive_run_label = self.output.run_label
         self.progressive_anchor_radius = self.anchor.anchor_radius
         self.progressive_anchor_min_keyframes = self.anchor.anchor_min_keyframes
+        self.progressive_anchor_origin_median_window = self.anchor.anchor_origin_median_window
         self.progressive_max_anchor_gaussians = self.anchor.max_anchor_gaussians
         self.progressive_max_anchor_keyframes = self.anchor.max_anchor_keyframes
         self.progressive_max_anchor_tsdf_voxels = self.anchor.max_anchor_tsdf_voxels
@@ -213,6 +229,14 @@ class ProgressiveConfig:
         self.progressive_low_frequency_spawn_fraction = self.anchor.low_frequency_spawn_fraction
         self.progressive_edge_probability_threshold = self.anchor.edge_probability_threshold
         self.progressive_spawn_opacity_init = self.anchor.spawn_opacity_init
+        self.progressive_mvs_depth_consistency_idepth = self.anchor.mvs_depth_consistency_idepth
+        self.progressive_mvs_mono_fallback_fraction = self.anchor.mvs_mono_fallback_fraction
+        self.progressive_mvs_mono_fallback_max_fraction = self.anchor.mvs_mono_fallback_max_fraction
+        self.progressive_mvs_target_ratio = self.anchor.mvs_target_ratio
+        self.progressive_mono_fallback_min_points = self.anchor.mono_fallback_min_points
+        self.progressive_tsdf_fusion_mode = self.anchor.tsdf_fusion_mode
+        self.progressive_delayed_tsdf_min_opacity = self.anchor.delayed_tsdf_min_opacity
+        self.progressive_delayed_tsdf_max_samples = self.anchor.delayed_tsdf_max_samples
         self.progressive_max_rasterized_gaussians = self.anchor.max_rasterized_gaussians
         self.progressive_anchor_render_check_every = self.anchor.anchor_render_check_every
         self.progressive_anchor_iterations = self.anchor.anchor_iterations
@@ -285,15 +309,21 @@ def parse_progressive_config(argv: list[str]) -> ProgressiveConfig:
     parser.add_argument("--parallax_ba_iters", type=int, default=4)
     parser.add_argument("--parallax_ref_weight", type=float, default=0.25)
     parser.add_argument("--enable_reboot", action="store_true")
+    parser.add_argument("--use_vggt_pose_prior", action="store_true")
+    parser.add_argument("--vggt_pose_prior_path", default="")
+    parser.add_argument("--relocalization_top_k", type=int, default=16)
+    parser.add_argument("--relocalization_min_triangulated", type=int, default=4)
+    parser.add_argument("--relocalization_max_keyframes", type=int, default=6)
 
     parser.add_argument("--progressive_overlap_mode", choices=["reserved", "off"], default="reserved")
     parser.add_argument("--progressive_backend_mode", choices=["progressive_scene_model"], default="progressive_scene_model")
     parser.add_argument("--max_active_keyframes", type=int, default=200)
     parser.add_argument("--progressive_anchor_radius", type=float, default=5.0)
     parser.add_argument("--progressive_anchor_min_keyframes", type=int, default=20)
+    parser.add_argument("--progressive_anchor_origin_median_window", type=int, default=5)
     parser.add_argument("--progressive_max_anchor_gaussians", type=int, default=250_000)
     parser.add_argument("--progressive_max_anchor_keyframes", type=int, default=80)
-    parser.add_argument("--progressive_max_anchor_tsdf_voxels", type=int, default=250_000)
+    parser.add_argument("--progressive_max_anchor_tsdf_voxels", type=int, default=0)
     parser.add_argument("--progressive_max_anchor_vram_mb", type=float, default=0.0)
     parser.add_argument("--progressive_anchor_final_iterations", type=int, default=5)
     parser.add_argument("--progressive_anchor_merge_voxel_size", type=float, default=0.05)
@@ -305,7 +335,19 @@ def parse_progressive_config(argv: list[str]) -> ProgressiveConfig:
     parser.add_argument("--progressive_low_frequency_spawn_fraction", type=float, default=0.15)
     parser.add_argument("--progressive_edge_probability_threshold", type=float, default=0.02)
     parser.add_argument("--progressive_spawn_opacity_init", type=float, default=0.06)
-    parser.add_argument("--progressive_max_rasterized_gaussians", type=int, default=60_000)
+    parser.add_argument("--progressive_mvs_depth_consistency_idepth", type=float, default=0.25)
+    parser.add_argument("--progressive_mvs_mono_fallback_fraction", type=float, default=0.25)
+    parser.add_argument("--progressive_mvs_mono_fallback_max_fraction", type=float, default=0.50)
+    parser.add_argument("--progressive_mvs_target_ratio", type=float, default=0.35)
+    parser.add_argument("--progressive_mono_fallback_min_points", type=int, default=2048)
+    parser.add_argument(
+        "--progressive_tsdf_fusion_mode",
+        choices=["disabled", "delayed_gaussian", "immediate_depth"],
+        default="disabled",
+    )
+    parser.add_argument("--progressive_delayed_tsdf_min_opacity", type=float, default=0.05)
+    parser.add_argument("--progressive_delayed_tsdf_max_samples", type=int, default=250_000)
+    parser.add_argument("--progressive_max_rasterized_gaussians", type=int, default=30_000)
     parser.add_argument("--progressive_anchor_render_check_every", type=int, default=25)
     parser.add_argument("--progressive_anchor_iterations", type=int, default=20)
     parser.add_argument("--progressive_anchor_train_views", type=int, default=4)
@@ -317,7 +359,7 @@ def parse_progressive_config(argv: list[str]) -> ProgressiveConfig:
     parser.add_argument("--depth_loss_weight_init", type=float, default=3e-2)
     parser.add_argument("--depth_loss_weight_decay", type=float, default=0.9)
     parser.add_argument("--progressive_depth_valid_epsilon", type=float, default=1e-6)
-    parser.add_argument("--progressive_tsdf_loss_weight", type=float, default=5e-3)
+    parser.add_argument("--progressive_tsdf_loss_weight", type=float, default=0.0)
     parser.add_argument("--progressive_anisotropy_loss_weight", type=float, default=1e-4)
     parser.add_argument("--max_gaussian_aspect_ratio", type=float, default=8.0)
     parser.add_argument("--progressive_rgb_visible_weight", type=float, default=0.85)
@@ -347,7 +389,11 @@ def parse_progressive_config(argv: list[str]) -> ProgressiveConfig:
     parser.add_argument("--progressive_manifest_name", default="progressive_manifest.json")
     parser.add_argument("--progressive_run_label", default="progressive_train")
     parser.add_argument("--progressive_lod", type=int, default=1)
-    parser.add_argument("--progressive_depth_scale_min_samples", type=int, default=16)
+    parser.add_argument("--save_test_renders", action="store_true", default=True)
+    parser.add_argument("--no_save_test_renders", dest="save_test_renders", action="store_false")
+    parser.add_argument("--test_render_every", type=int, default=1)
+    parser.add_argument("--test_render_dir", default="test_renders")
+    parser.add_argument("--progressive_depth_scale_min_samples", type=int, default=3)
     parser.add_argument("--progressive_min_depth_scale", type=float, default=1e-3)
     parser.add_argument("--progressive_max_depth_scale", type=float, default=1e3)
     parser.add_argument("--progressive_require_calibrated_depth", action="store_true", default=True)
@@ -404,11 +450,17 @@ def parse_progressive_config(argv: list[str]) -> ProgressiveConfig:
             parallax_ba_iters=parsed.parallax_ba_iters,
             parallax_ref_weight=parsed.parallax_ref_weight,
             enable_reboot=parsed.enable_reboot,
+            use_vggt_pose_prior=parsed.use_vggt_pose_prior,
+            vggt_pose_prior_path=parsed.vggt_pose_prior_path,
+            relocalization_top_k=parsed.relocalization_top_k,
+            relocalization_min_triangulated=parsed.relocalization_min_triangulated,
+            relocalization_max_keyframes=parsed.relocalization_max_keyframes,
         ),
         anchor=AnchorConfig(
             sh_degree=parsed.sh_degree,
             anchor_radius=parsed.progressive_anchor_radius,
             anchor_min_keyframes=parsed.progressive_anchor_min_keyframes,
+            anchor_origin_median_window=parsed.progressive_anchor_origin_median_window,
             max_active_keyframes=parsed.max_active_keyframes,
             max_anchor_gaussians=parsed.progressive_max_anchor_gaussians,
             max_anchor_keyframes=parsed.progressive_max_anchor_keyframes,
@@ -424,6 +476,14 @@ def parse_progressive_config(argv: list[str]) -> ProgressiveConfig:
             low_frequency_spawn_fraction=parsed.progressive_low_frequency_spawn_fraction,
             edge_probability_threshold=parsed.progressive_edge_probability_threshold,
             spawn_opacity_init=parsed.progressive_spawn_opacity_init,
+            mvs_depth_consistency_idepth=parsed.progressive_mvs_depth_consistency_idepth,
+            mvs_mono_fallback_fraction=parsed.progressive_mvs_mono_fallback_fraction,
+            mvs_mono_fallback_max_fraction=parsed.progressive_mvs_mono_fallback_max_fraction,
+            mvs_target_ratio=parsed.progressive_mvs_target_ratio,
+            mono_fallback_min_points=parsed.progressive_mono_fallback_min_points,
+            tsdf_fusion_mode=parsed.progressive_tsdf_fusion_mode,
+            delayed_tsdf_min_opacity=parsed.progressive_delayed_tsdf_min_opacity,
+            delayed_tsdf_max_samples=parsed.progressive_delayed_tsdf_max_samples,
             max_rasterized_gaussians=parsed.progressive_max_rasterized_gaussians,
             anchor_render_check_every=parsed.progressive_anchor_render_check_every,
             anchor_iterations=parsed.progressive_anchor_iterations,
@@ -472,6 +532,9 @@ def parse_progressive_config(argv: list[str]) -> ProgressiveConfig:
             run_label=parsed.progressive_run_label,
             lod_min=parsed.progressive_lod,
             lod_max=parsed.progressive_lod,
+            save_test_renders=parsed.save_test_renders,
+            test_render_every=parsed.test_render_every,
+            test_render_dir=parsed.test_render_dir,
         ),
         scale=ScaleConfig(
             min_triangulated_samples=parsed.progressive_depth_scale_min_samples,

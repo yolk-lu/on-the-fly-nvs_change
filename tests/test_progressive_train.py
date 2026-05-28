@@ -2,7 +2,9 @@ import json
 import pathlib
 import re
 
-from Progressive_train import _collect_output_status, _parse_progressive_args, _write_manifest
+import torch
+
+from Progressive_train import ProgressiveTrainer, _collect_output_status, _parse_progressive_args, _recent_keyframe_centre_median, _write_manifest
 from pipeline.progressive_config import parse_progressive_config
 
 
@@ -24,6 +26,7 @@ def test_progressive_config_owns_training_args():
     )
     assert cfg.overlap_mode == "reserved"
     assert cfg.anchor_radius == 4.0
+    assert cfg.anchor_origin_median_window == 5
     assert cfg.anchor_train_views == 3
     assert cfg.sh_degree == 3
     assert cfg.max_active_keyframes == 200
@@ -34,12 +37,24 @@ def test_progressive_config_owns_training_args():
     assert cfg.low_frequency_spawn_fraction == 0.15
     assert cfg.edge_probability_threshold == 0.02
     assert cfg.spawn_opacity_init == 0.06
-    assert cfg.max_rasterized_gaussians == 60000
+    assert cfg.mvs_depth_consistency_idepth == 0.25
+    assert cfg.mvs_mono_fallback_fraction == 0.25
+    assert cfg.mvs_mono_fallback_max_fraction == 0.50
+    assert cfg.mvs_target_ratio == 0.35
+    assert cfg.mono_fallback_min_points == 2048
+    assert cfg.tsdf_fusion_mode == "disabled"
+    assert cfg.delayed_tsdf_min_opacity == 0.05
+    assert cfg.delayed_tsdf_max_samples == 250000
+    assert cfg.depth_scale_min_samples == 3
+    assert cfg.max_rasterized_gaussians == 30000
     assert cfg.min_displacement == 0.03
     assert cfg.pyr_levels == 2
     assert cfg.depth_valid_epsilon == 1e-6
     assert cfg.use_vggt_pose_prior is False
     assert cfg.pose_use_lsf_velocity_gate is False
+    assert cfg.relocalization_top_k == 16
+    assert cfg.relocalization_min_triangulated == 4
+    assert cfg.relocalization_max_keyframes == 6
     assert clean_argv == ["Progressive_train.py"]
 
 
@@ -79,7 +94,7 @@ def test_progressive_manifest_records_reserved_overlap(tmp_path):
     assert payload["progressive"]["overlap_optimization"] == "reserved_not_implemented"
     assert payload["progressive"]["backend_mode"] == "progressive_scene_model"
     assert payload["progressive"]["trainer_entrypoint"] == "Progressive_train.py"
-    assert payload["progressive"]["pose_graph_optimization"] == "sim3_enabled_after_verified_loop"
+    assert payload["progressive"]["pose_graph_optimization"] == "sim3_enabled_always"
     assert payload["progressive_config"]["pose"]["use_vggt_pose_prior"] is False
     assert payload["progressive_config"]["pose"]["pose_use_lsf_velocity_gate"] is False
     assert payload["outputs"]["complete"]
@@ -110,3 +125,47 @@ def test_progressive_config_exposes_args_used_by_progressive_modules():
         attrs.update(re.findall(r"(?:self\.)?args\.([A-Za-z_][A-Za-z0-9_]*)", path.read_text(errors="ignore")))
     missing = sorted(attr for attr in attrs if not hasattr(cfg, attr))
     assert missing == []
+
+
+def test_recent_anchor_origin_uses_coordinate_median_against_single_outlier():
+    class _Keyframe:
+        def __init__(self, centre):
+            self.centre = centre
+
+        def get_centre(self, approx=False):
+            return self.centre
+
+    fallback = torch.tensor([100.0, -100.0, 5.0])
+    centres = [
+        _Keyframe(torch.tensor([0.0, 0.0, 0.0])),
+        _Keyframe(torch.tensor([1.0, 0.0, 0.0])),
+        _Keyframe(torch.tensor([2.0, 0.0, 0.0])),
+        _Keyframe(fallback),
+        _Keyframe(torch.tensor([3.0, 0.0, 0.0])),
+    ]
+
+    origin = _recent_keyframe_centre_median(centres, fallback, window=5)
+
+    assert torch.allclose(origin, torch.tensor([2.0, 0.0, 0.0]))
+
+
+def test_adaptive_mono_fallback_uses_base_when_mvs_ratio_is_high():
+    fraction = ProgressiveTrainer._adaptive_mono_fallback_fraction(
+        mvs_ratio=0.50,
+        base_fraction=0.25,
+        max_fraction=0.50,
+        target_mvs_ratio=0.35,
+    )
+
+    assert fraction == 0.25
+
+
+def test_adaptive_mono_fallback_uses_max_when_mvs_ratio_is_zero():
+    fraction = ProgressiveTrainer._adaptive_mono_fallback_fraction(
+        mvs_ratio=0.0,
+        base_fraction=0.25,
+        max_fraction=0.50,
+        target_mvs_ratio=0.35,
+    )
+
+    assert fraction == 0.50

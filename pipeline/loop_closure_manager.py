@@ -50,7 +50,7 @@ class LoopClosureManager:
         self.place_index = place_index
         self.pose_graph_optimizer = pose_graph_optimizer or AnchorPoseGraphOptimizer()
         self.events: list[LoopClosureEvent] = []
-        self.pose_graph_optimization_status = "enabled"
+        self.pose_graph_optimization_status = "sim3_enabled_always"
         self.last_pose_graph_result: AnchorPoseGraphResult | None = None
 
     def check_anchor_rollover(
@@ -60,6 +60,9 @@ class LoopClosureManager:
         controller: ReconstructionController,
         matcher_fn: Callable[[FrameState, FrameState], object],
     ) -> list[LoopClosureEvent]:
+        if len(controller.anchors) < 2:
+            return []
+        self.optimize_sequential_rollover(controller)
         if len(controller.anchors) < 3:
             return []
         src_id = int(new_anchor_id)
@@ -112,6 +115,13 @@ class LoopClosureManager:
             self.events.append(event)
             events.append(event)
         return events
+
+    def optimize_sequential_rollover(self, controller: ReconstructionController) -> AnchorPoseGraphResult | None:
+        if len(controller.graph.edges) == 0:
+            return None
+        result = controller.optimize_anchor_graph(self.pose_graph_optimizer)
+        self.last_pose_graph_result = result
+        return result
 
     def check_frame_candidates(
         self,

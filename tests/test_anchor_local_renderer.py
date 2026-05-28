@@ -200,6 +200,41 @@ def test_depth_loss_ignores_unrendered_background(monkeypatch):
     assert losses.ssim_weight.item() == 0.0
 
 
+def test_render_from_keyframe_updates_latest_invdepth(monkeypatch):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    controller = ReconstructionController(device=device)
+    controller.create_anchor()
+    model = ProgressiveSceneModel(controller, 8, 8, 10.0, device=device)
+    result = AnchorRenderResult(
+        render=torch.zeros(3, 8, 8, device=device),
+        invdepth=torch.ones(1, 8, 8, device=device),
+        main_gaussian_id=torch.zeros(1, 8, 8, device=device, dtype=torch.int32),
+        radii=torch.zeros(0, device=device, dtype=torch.int32),
+        visibility_filter=torch.zeros(0, device=device, dtype=torch.bool),
+        screenspace_points=torch.zeros(0, 3, device=device),
+        anchor_ids=torch.zeros(0, device=device, dtype=torch.long),
+        local_indices=torch.zeros(0, device=device, dtype=torch.long),
+        kept_indices=torch.zeros(0, device=device, dtype=torch.long),
+        guard_reason_counts={},
+    )
+    monkeypatch.setattr(model, "render", lambda view_matrix, cam_centre_world, active_anchor_ids=None: result)
+
+    class _Keyframe:
+        latest_invdepth = None
+
+        def get_Rt(self):
+            return torch.eye(4, device=device)
+
+        def get_centre(self, approx=False):
+            return torch.zeros(3, device=device)
+
+    keyframe = _Keyframe()
+    model.render_from_keyframe(keyframe, active_anchor_ids=[0])
+
+    assert keyframe.latest_invdepth is not None
+    assert torch.allclose(keyframe.latest_invdepth, result.invdepth)
+
+
 def test_normalized_inverse_depth_loss_is_scale_shift_invariant():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     controller = ReconstructionController(device=device)

@@ -1,7 +1,9 @@
 import torch
 
 from pipeline.anchor_pose_graph_optimizer import AnchorPoseGraphOptimizer, compose_sim3
+from pipeline.reconstruction_controller import ReconstructionController
 from scene.anchor_graph import AnchorGraph
+from scene.scale_alignment import ScaleAlignmentResult
 
 
 def _T(scale=1.0, t=(0.0, 0.0, 0.0)):
@@ -53,3 +55,16 @@ def test_sim3_scale_loop_corrects_anchor_scale_jump():
     update = next(item for item in result.updates if item.anchor_id == 1)
     assert result.converged
     assert abs(float(update.s_anchor_to_world) - 1.0) < 0.1
+
+
+def test_controller_sequential_edge_uses_valid_scale_alignment_measurement():
+    scale_alignment = ScaleAlignmentResult(
+        scale_map=torch.ones(1, 1),
+        valid_mask=torch.ones(1, 1, dtype=torch.bool),
+        global_scale=torch.tensor(2.0),
+        num_valid_cells=1,
+    )
+
+    measured = ReconstructionController._sequential_edge_measurement(_T(scale=1.0), scale_alignment)
+
+    assert torch.allclose(measured[:3, :3], torch.eye(3) * 2.0)

@@ -69,11 +69,19 @@ class GaussianSpawnPolicy:
     ) -> GaussianSpawnResult:
         image = frame.image
         init_proba = get_lapla_norm(image, self.disc_kernel) * self.init_proba_scaler
-        penalty = 0.0
+        # penalty = 0.0
+
         if rendered_image is not None:
             penalty = get_lapla_norm(rendered_image.detach(), self.disc_kernel) * self.init_proba_scaler
-        edge_proba = (init_proba - penalty).clamp(0, 1)
+            beta = 2.0
+            edge_proba = (init_proba * torch.exp(-beta * penalty))
+        else:
+            edge_proba = init_proba
+
+
+        edge_proba = edge_proba.clamp(0, 1)
         sample_proba = edge_proba
+
         conf_map = self._confidence_map(frame)
         if self.surface_sample_floor > 0:
             low_freq_floor = self.surface_sample_floor * conf_map.clamp(0, 1)
@@ -110,7 +118,7 @@ class GaussianSpawnPolicy:
         mono_idepth = F.grid_sample(frame.mono_idepth, sampler[None, None], mode="bilinear", align_corners=True)[0, 0, 0]
         mono_conf = F.grid_sample(frame.mono_depth_conf, sampler[None, None], mode="bilinear", align_corners=True)[0, 0, 0]
         depth = 1.0 / mono_idepth.clamp(1e-6, 1e6)
-        valid = torch.isfinite(depth) & (depth > 1e-6) & torch.isfinite(mono_conf) & (mono_conf > self.min_depth_conf)
+        valid = torch.isfinite(depth) & (depth > 1e-6) & (depth < 150.0) & torch.isfinite(mono_conf) & (mono_conf > self.min_depth_conf)
         if rendered_invdepth is not None:
             rendered_depth = 1.0 / rendered_invdepth[0, sample_mask].clamp_min(1e-8)
             valid &= depth < rendered_depth

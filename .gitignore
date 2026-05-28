@@ -25,6 +25,8 @@ tests/*
 !tests/test_keyframe_store.py
 !tests/test_loop_closure_manager.py
 !tests/test_progressive_train.py
+!tests/test_tsdf_fusion.py
+!tools/test_dinov2_gaussian_spawn.py
 LSF.md
 Problem.md
 Test.md

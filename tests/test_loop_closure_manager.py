@@ -69,7 +69,7 @@ def test_loop_closure_manager_accepts_verified_non_adjacent_anchor():
     assert controller.graph.edges[-1].kind == "loop"
     assert controller.graph.edges[-1].src == 2
     assert controller.graph.edges[-1].dst == 0
-    assert manager.summary()["pose_graph_optimization"]["status"] == "enabled"
+    assert manager.summary()["pose_graph_optimization"]["status"] == "sim3_enabled_always"
 
 
 def test_loop_closure_manager_rejects_failed_verification_without_graph_edge():
@@ -91,3 +91,15 @@ def test_loop_closure_manager_rejects_failed_verification_without_graph_edge():
     assert not results[0].accepted
     assert results[0].reason == "not_enough_matches"
     assert len(controller.graph.edges) == before
+
+
+def test_loop_closure_manager_runs_sequential_pgo_without_loop_candidate():
+    controller = ReconstructionController(device="cpu")
+    controller.create_anchor()
+    controller.create_anchor()
+    manager = LoopClosureManager(min_anchor_gap=2, max_candidates=2)
+
+    results = manager.check_anchor_rollover(1, _store(), controller, lambda *_: None)
+
+    assert results == []
+    assert manager.summary()["pose_graph_optimization"]["last_reason"] != "not_run"

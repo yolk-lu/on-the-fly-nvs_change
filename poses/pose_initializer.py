@@ -195,6 +195,25 @@ class PoseInitializer():
         )
         return intr
 
+    def get_vggt_pose_prior_rt(self, frame_uid: Optional[int] = None):
+        if self.vggt_pose_prior is None or frame_uid is None:
+            return None
+        return self.vggt_pose_prior.get_rt(int(frame_uid))
+
+    def get_vggt_intrinsics_prior(self, frame_uid: Optional[int] = None):
+        return self._get_vggt_intrinsics_prior(frame_uid)
+
+    def _lock_translation_to_vggt_prior(self, Rt: torch.Tensor, frame_uid: Optional[int] = None) -> torch.Tensor:
+        prior_Rt = self.get_vggt_pose_prior_rt(frame_uid)
+        if prior_Rt is None:
+            return Rt
+        prior_centre = self._camera_center_from_rt(prior_Rt).to(device=Rt.device, dtype=Rt.dtype)
+        if not torch.isfinite(prior_centre).all():
+            return Rt
+        locked = Rt.detach().clone()
+        locked[:3, 3] = -(locked[:3, :3] @ prior_centre)
+        return locked
+
     @staticmethod
     def _camera_center_from_rt(Rt: torch.Tensor):
         R = Rt[:3, :3]
@@ -652,6 +671,7 @@ class PoseInitializer():
         Rt = torch.eye(4, device="cuda")
         Rt[:3, :3] = sixD2mtx(Rs6D)[0]
         Rt[:3, 3] = ts[0]
+        Rt = self._lock_translation_to_vggt_prior(Rt, frame_uid)
 
         # Check if we have sufficiently many inliers
         n_inliers = mask.sum().item()

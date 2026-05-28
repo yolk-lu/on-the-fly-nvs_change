@@ -50,6 +50,17 @@ def test_tracking_keyframe_store_adds_pose_and_colmap_export():
     assert image.name == "0010.png"
 
 
+def test_tracking_keyframe_lastest_invdepth_alias_tracks_latest_invdepth():
+    store = _store()
+    keyframe = store.add(_frame(10), torch.eye(4), 12.0, index=0)
+    invdepth = torch.ones(1, 8, 8)
+
+    keyframe.lastest_invdepth = invdepth
+
+    assert keyframe.latest_invdepth is invdepth
+    assert keyframe.lastest_invdepth is invdepth
+
+
 def test_tracking_keyframe_store_prev_selection_uses_match_score():
     store = _store()
     for i, offset in enumerate([0.0, 10.0, 20.0]):

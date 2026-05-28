@@ -65,7 +65,7 @@ def test_create_active_anchor_records_grid_scale_alignment():
     assert torch.allclose(anchor.scale_alignment.global_scale, torch.tensor(2.0), atol=1e-6)
 
 
-def test_anchor_budget_status_uses_gaussian_keyframe_and_tsdf_limits():
+def test_anchor_budget_status_uses_gaussian_and_keyframe_limits_with_tsdf_noop():
     controller = ReconstructionController(device="cpu")
     anchor = controller.create_anchor()
     anchor.gaussian_model.append(
@@ -93,4 +93,5 @@ def test_anchor_budget_status_uses_gaussian_keyframe_and_tsdf_limits():
     assert status["should_roll"]
     assert "max_anchor_gaussians" in status["reasons"]
     assert "max_anchor_keyframes" in status["reasons"]
-    assert "max_anchor_tsdf_voxels" in status["reasons"]
+    assert "max_anchor_tsdf_voxels" not in status["reasons"]
+    assert status["num_tsdf_voxels"] == 0

@@ -28,12 +28,13 @@ from poses.feature_detector import Detector
 from poses.matcher import Matcher
 from poses.pose_initializer import PoseInitializer
 from poses.triangulator import Triangulator
+from poses.guided_mvs import GuidedMVS
 from resource_tracker import ResourceTracker
 from scene.dense_extractor import DenseExtractor
 from scene.mono_depth import MonoDepthEstimator
 from scene.progressive_scene_model import ProgressiveSceneModel
 from scene.tsdf_fusion import TSDFFusion
-from utils import align_mean_up_fwd, inverse_sigmoid, make_torch_sampler, pts2px
+from utils import RGB2SH, align_mean_up_fwd, depth2points, inverse_sigmoid, make_torch_sampler, pts2px
 
 
 @dataclass
@@ -167,9 +168,11 @@ def _collect_output_status(model_path: str) -> dict:
         "resource_stats": os.path.exists(os.path.join(model_path, "resource_stats.txt")),
         "loss_records": os.path.exists(os.path.join(model_path, "loss_records.csv")),
         "loss_curve": os.path.exists(os.path.join(model_path, "loss_curve.png")),
+        "test_renders_dir": os.path.isdir(os.path.join(model_path, "test_renders")),
+        "test_render_images": len(glob.glob(os.path.join(model_path, "test_renders", "*_render.png"))) > 0,
         "lod_completion_marker": len(glob.glob(os.path.join(model_path, "lod_*_complete.json"))) > 0,
     }
-    optional = {"loss_records", "loss_curve"}
+    optional = {"loss_records", "loss_curve", "test_renders_dir", "test_render_images"}
     required_missing = [name for name, ok in checks.items() if not ok and name not in optional]
     return {
         "model_path": model_path,
@@ -177,6 +180,18 @@ def _collect_output_status(model_path: str) -> dict:
         "missing": required_missing,
         "complete": len(required_missing) == 0,
     }
+
+
+def _recent_keyframe_centre_median(keyframes: list[TrackingKeyframe], fallback: torch.Tensor, window: int) -> torch.Tensor:
+    recent = keyframes[-max(1, int(window)) :]
+    centres = [
+        keyframe.get_centre(approx=True).detach().to(device=fallback.device, dtype=fallback.dtype)
+        for keyframe in recent
+    ]
+    centres = [centre for centre in centres if centre.shape == fallback.shape and torch.isfinite(centre).all()]
+    if len(centres) == 0:
+        return fallback.detach().clone()
+    return torch.stack(centres, dim=0).median(dim=0).values
 
 
 def _write_manifest(
@@ -216,14 +231,25 @@ def _write_manifest(
             "low_frequency_spawn_fraction": cfg.low_frequency_spawn_fraction,
             "edge_probability_threshold": cfg.edge_probability_threshold,
             "spawn_opacity_init": cfg.spawn_opacity_init,
+            "mvs_depth_consistency_idepth": cfg.mvs_depth_consistency_idepth,
+            "mvs_mono_fallback_fraction": cfg.mvs_mono_fallback_fraction,
+            "mvs_mono_fallback_max_fraction": cfg.mvs_mono_fallback_max_fraction,
+            "mvs_target_ratio": cfg.mvs_target_ratio,
+            "mono_fallback_min_points": cfg.mono_fallback_min_points,
+            "tsdf_fusion_mode": cfg.tsdf_fusion_mode,
+            "delayed_tsdf_min_opacity": cfg.delayed_tsdf_min_opacity,
+            "delayed_tsdf_max_samples": cfg.delayed_tsdf_max_samples,
             "max_rasterized_gaussians": cfg.max_rasterized_gaussians,
             "anchor_render_check_every": cfg.anchor_render_check_every,
             "anchor_iterations": cfg.anchor_iterations,
             "anchor_train_views": cfg.anchor_train_views,
+            "save_test_renders": cfg.save_test_renders,
+            "test_render_every": cfg.test_render_every,
+            "test_render_dir": cfg.test_render_dir,
             "loop_max_candidates": cfg.loop_check_max_candidates,
             "loop_min_anchor_gap": cfg.loop_min_anchor_gap,
             "depth_valid_epsilon": cfg.depth_valid_epsilon,
-            "pose_graph_optimization": "sim3_enabled_after_verified_loop",
+            "pose_graph_optimization": "sim3_enabled_always",
             "completion_gate": "Progressive_train.py exits successfully and writes reconstruction outputs",
         },
         "progressive_config": cfg.to_manifest(),
@@ -272,6 +298,7 @@ class ProgressiveTrainer:
         self.prev_frame = None
         self.frame_states: dict[int, object] = {}
         self.current_lod = int(getattr(args, "lod_min", 1))
+        self.saved_test_render_frames: set[int] = set()
 
     def initialize(self) -> None:
         if "://" in self.args.source_path:
@@ -319,6 +346,7 @@ class ProgressiveTrainer:
             device="cuda",
         )
         self.keyframe_store.f = self.state.focal_px
+        self.guided_mvs = GuidedMVS(self.args)
         semantic_extractor = None
         if self.args.use_semantic_features:
             from poses.semantic_extractor import SemanticExtractor
@@ -461,12 +489,13 @@ class ProgressiveTrainer:
         self._maybe_reboot()
 
         if self.state.n_keyframes >= self.args.num_keyframes_miniba_bootstrap:
-            return self._register_incremental_keyframe(image, info, desc_kpts)
+            return self._register_incremental_keyframe(frame)
         return 0
 
     def _bootstrap_scene(self) -> None:
         with self.tracker.track("BAB"):
             Rts, f, _ = self.pose_initializer.initialize_bootstrap(self.bootstrap_desc_kpts)
+            Rts, f = self._apply_vggt_bootstrap_prior(Rts, f)
             self.state.focal_px = float(f.detach().cpu().item())
             self.keyframe_store.f = self.state.focal_px
             self.anchor_scene_model.update_intrinsics(f)
@@ -503,6 +532,22 @@ class ProgressiveTrainer:
             )
         self.state.last_reboot = self.state.n_keyframes
 
+    def _apply_vggt_bootstrap_prior(self, Rts: torch.Tensor, focal: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        prior_Rts = []
+        prior_focal = None
+        for frame in self.bootstrap_frames:
+            frame_id = int(frame.frame_id)
+            prior_Rt = self.pose_initializer.get_vggt_pose_prior_rt(frame_id)
+            if prior_Rt is None or not torch.isfinite(prior_Rt).all():
+                return Rts, focal
+            prior_Rts.append(prior_Rt.to(device=Rts.device, dtype=Rts.dtype))
+            if prior_focal is None:
+                intrinsics = self.pose_initializer.get_vggt_intrinsics_prior(frame_id)
+                if intrinsics is not None:
+                    prior_focal = intrinsics["focal"].to(device=focal.device, dtype=focal.dtype)
+        print(f"[PosePrior] Using VGGT metric bootstrap poses for {len(prior_Rts)} frames.")
+        return torch.stack(prior_Rts, dim=0), focal if prior_focal is None else prior_focal
+
     def _maybe_reboot(self) -> None:
         if (
             self.args.enable_reboot
@@ -530,7 +575,8 @@ class ProgressiveTrainer:
             self.state.needs_reboot = False
             self.state.last_reboot = self.state.n_keyframes
 
-    def _register_incremental_keyframe(self, image, info: dict, desc_kpts) -> int:
+    def _register_incremental_keyframe(self, frame) -> int:
+        image, info, desc_kpts = frame.image, frame.info, frame.desc_kpts
         with self.tracker.track("tri"):
             prev_keyframes = self.keyframe_store.get_prev_keyframes(
                 self.args.num_prev_keyframes_miniba_incr, True, desc_kpts
@@ -548,11 +594,110 @@ class ProgressiveTrainer:
             )
 
         if Rt is None:
-            self._queue_failed_pose_candidate(image, info, desc_kpts)
-            return -1
+            Rt = self._try_global_relocalization(frame, desc_kpts)
+            if Rt is None:
+                self._queue_failed_pose_candidate(image, info, desc_kpts)
+                return -1
+            info["pose_source"] = "global_relocalization"
 
         self._add_initialized_keyframe(image, info, desc_kpts, Rt, self.state.n_keyframes, "incremental_opt")
         return self._retry_pending_keyframes()
+
+    def _try_global_relocalization(self, frame, desc_kpts):
+        if self.place_index is None or len(self.keyframe_store.keyframes) == 0:
+            frame.info["relocalization"] = {
+                "attempted": False,
+                "accepted": False,
+                "failure_reason": "empty_global_descriptor_index",
+            }
+            return None
+        candidates = self.place_index.query_frame_for_relocalization(
+            frame,
+            top_k=self.args.relocalization_top_k,
+            exclude_self_frame_id=frame.frame_id,
+        )
+        attempts = []
+        selected_keyframes = []
+        seen_indices = set()
+        for candidate in candidates:
+            keyframe = self.keyframe_store.by_index(candidate.keyframe_index)
+            if keyframe is None or int(keyframe.index) in seen_indices:
+                continue
+            desc = keyframe.desc_kpts
+            triangulated = 0
+            if desc is not None and getattr(desc, "has_pt3d", None) is not None:
+                triangulated = int(desc.has_pt3d.sum().detach().cpu().item())
+            attempt = {
+                "retrieval_backend": "dinov2_vlad" if candidate.vlad_ready else "dinov2_mean_pool",
+                "global_descriptor_backend": candidate.descriptor_backend,
+                "retrieval_score": float(candidate.score),
+                "retrieval_threshold": float(candidate.threshold),
+                "candidate_keyframe_index": int(candidate.keyframe_index),
+                "candidate_anchor_id": int(candidate.anchor_id),
+                "candidate_frame_id": int(candidate.frame_id),
+                "candidate_triangulated_points": int(triangulated),
+                "accepted": False,
+                "failure_reason": "",
+            }
+            if triangulated < int(self.args.relocalization_min_triangulated):
+                attempt["failure_reason"] = "relocalization_failed_no_3d"
+                attempts.append(attempt)
+                continue
+            selected_keyframes.append(keyframe)
+            seen_indices.add(int(keyframe.index))
+            attempts.append(attempt)
+            if len(selected_keyframes) >= int(self.args.relocalization_max_keyframes):
+                break
+        if len(selected_keyframes) == 0:
+            frame.info["relocalization"] = {
+                "attempted": True,
+                "accepted": False,
+                "failure_reason": "relocalization_failed_no_3d",
+                "candidates": attempts,
+            }
+            return None
+        for keyframe in selected_keyframes:
+            keyframe.update_3dpts(self.keyframe_store.keyframes)
+        with self.tracker.track("Reloc"):
+            Rt = self.pose_initializer.initialize_incremental(
+                selected_keyframes,
+                desc_kpts,
+                self.state.n_keyframes,
+                frame.info["is_test"],
+                frame.image,
+                all_keyframes=self.keyframe_store.keyframes,
+                retry_count=0,
+                frame_uid=frame.info.get("frame_id"),
+            )
+        geom = dict(getattr(self.pose_initializer, "last_geom_debug", {}))
+        accepted = Rt is not None
+        for attempt in attempts:
+            if int(attempt.get("candidate_keyframe_index", -1)) in {int(kf.index) for kf in selected_keyframes}:
+                attempt["local_matches"] = int(geom.get("total_2d3d_matches", 0))
+                attempt["pnp_inliers"] = int(geom.get("pnp_inliers", 0))
+                attempt["miniba_inliers"] = int(geom.get("miniba_inliers", 0))
+                attempt["accepted"] = bool(accepted)
+                attempt["failure_reason"] = "" if accepted else f"relocalization_failed_{self.pose_initializer.last_failure_reason}"
+        frame.info["relocalization"] = {
+            "attempted": True,
+            "accepted": bool(accepted),
+            "failure_reason": "" if accepted else f"relocalization_failed_{self.pose_initializer.last_failure_reason}",
+            "pose_source": "global_relocalization" if accepted else "",
+            "num_candidates": int(len(candidates)),
+            "num_selected_keyframes": int(len(selected_keyframes)),
+            "candidates": attempts,
+            "pose_initialization": geom,
+        }
+        if accepted:
+            frame.info["pose_source"] = "global_relocalization"
+            print(
+                "[Relocalization] "
+                f"frame={frame.frame_id} accepted "
+                f"selected={len(selected_keyframes)} "
+                f"pnp={geom.get('pnp_inliers', 0)} "
+                f"miniba={geom.get('miniba_inliers', 0)}"
+            )
+        return Rt
 
     def _add_initialized_keyframe(self, image, info: dict, desc_kpts, Rt, index: int, phase: str) -> None:
         with self.tracker.track("Add"):
@@ -567,6 +712,7 @@ class ProgressiveTrainer:
             )
             frame = self.frame_states.get(int(info.get("frame_id", index)))
             if frame is not None:
+                frame.info["pose_initialization"] = dict(getattr(self.pose_initializer, "last_geom_debug", {}))
                 self._calibrate_keyframe_depth_from_triangulation(keyframe)
                 self._attach_frame_to_controller(frame, keyframe)
 
@@ -644,6 +790,7 @@ class ProgressiveTrainer:
         )
 
     def _seal_anchor_and_start_next(self, anchor, cam_centre: torch.Tensor, reference_frame, new_frame, status: dict) -> None:
+        anchor_origin = self._recent_anchor_origin(cam_centre)
         if anchor.gaussian_model.n > 0 and self.cfg.anchor_final_iterations > 0 and len(anchor.keyframe_ids) > 0:
             last_frame_id = int(anchor.keyframe_ids[-1])
             last_keyframe = self.keyframe_store.by_frame_id(last_frame_id)
@@ -662,6 +809,10 @@ class ProgressiveTrainer:
             voxel_size=self.cfg.anchor_merge_voxel_size,
             target_max=self.cfg.anchor_merge_target_gaussians,
         )
+        delayed_tsdf_stats = {}
+        if self.cfg.tsdf_fusion_mode == "delayed_gaussian":
+            with self.tracker.track("DelayedTSDF"):
+                delayed_tsdf_stats = self._integrate_delayed_tsdf(anchor)
         if self.args.model_path:
             with self.tracker.track("AnchorSealSave"):
                 self.anchor_scene_model.save_anchor(self.args.model_path, anchor)
@@ -670,29 +821,57 @@ class ProgressiveTrainer:
             "reasons": list(status.get("reasons", [])),
             "budget_status": status,
             "merge": merge_stats,
-            "new_anchor_origin": cam_centre.detach().cpu().tolist(),
+            "delayed_tsdf": delayed_tsdf_stats,
+            "raw_rollover_centre": cam_centre.detach().cpu().tolist(),
+            "new_anchor_origin": anchor_origin.detach().cpu().tolist(),
+            "anchor_origin_median_window": int(self.cfg.anchor_origin_median_window),
         }
         self.anchor_seal_events.append(event)
         print(
             "[AnchorSeal] "
             f"anchor={anchor.anchor_id} reasons={event['reasons']} "
             f"gaussians={status.get('num_gaussians', 0)} "
-            f"merge_after={merge_stats.get('after', anchor.gaussian_model.n)}"
+            f"merge_after={merge_stats.get('after', anchor.gaussian_model.n)} "
+            f"delayed_tsdf={delayed_tsdf_stats.get('integrated', 0)}"
         )
         self.controller.create_active_anchor(
-            torch.eye(3, device=cam_centre.device, dtype=cam_centre.dtype),
-            cam_centre,
+            torch.eye(3, device=anchor_origin.device, dtype=anchor_origin.dtype),
+            anchor_origin,
             reference_frame=reference_frame,
             new_frame=new_frame,
+        )
+        if self.loop_manager is not None:
+            self.loop_manager.optimize_sequential_rollover(self.controller)
+
+    def _integrate_delayed_tsdf(self, anchor) -> dict:
+        if getattr(anchor, "_delayed_tsdf_fused", False):
+            return dict(getattr(anchor, "_delayed_tsdf_stats", {"mode": "delayed_gaussian", "skipped": "already_fused"}))
+        stats = self.tsdf_fusion.integrate_optimized_gaussians(
+            anchor.tsdf,
+            anchor.gaussian_model,
+            anchor,
+            min_opacity=self.cfg.delayed_tsdf_min_opacity,
+            max_samples=self.cfg.delayed_tsdf_max_samples,
+        )
+        anchor._delayed_tsdf_fused = True
+        anchor._delayed_tsdf_stats = stats
+        return stats
+
+    def _recent_anchor_origin(self, cam_centre: torch.Tensor) -> torch.Tensor:
+        return _recent_keyframe_centre_median(
+            self.keyframe_store.keyframes,
+            cam_centre,
+            self.cfg.anchor_origin_median_window,
         )
 
     def _attach_frame_to_controller(self, frame, keyframe: TrackingKeyframe) -> None:
         cam_centre = keyframe.get_centre(approx=True).detach()
+        anchor_origin = self._recent_anchor_origin(cam_centre)
         active_anchor = self.controller.active_anchor()
         rolled_anchor = False
         if len(active_anchor.keyframe_ids) == 0:
             with self.controller.anchor_locks[active_anchor.anchor_id].write_lock():
-                active_anchor.t_anchor_to_world = cam_centre.to(active_anchor.device)
+                active_anchor.t_anchor_to_world = anchor_origin.to(active_anchor.device)
                 self.controller.graph.add_node(active_anchor.anchor_id, active_anchor.T_anchor_to_world)
         else:
             budget_status = self._anchor_budget_status(active_anchor, cam_centre)
@@ -829,17 +1008,18 @@ class ProgressiveTrainer:
         with self.controller.anchor_locks[anchor.anchor_id].write_lock():
             self._spawn_triangulated_keypoint_gaussians(anchor, keyframe, R_cam_to_world, t_cam_to_world)
             if calibrated_depth or not self.cfg.require_calibrated_depth:
-                self.tsdf_fusion.integrate_depth(
-                    anchor.tsdf,
-                    frame.mono_idepth,
-                    frame.mono_depth_conf,
-                    anchor.R_world_to_anchor,
-                    anchor.t_world_to_anchor,
-                    R_cam_to_world,
-                    t_cam_to_world,
-                    self.keyframe_store.f,
-                    self.keyframe_store.centre,
-                )
+                if self.cfg.tsdf_fusion_mode == "immediate_depth":
+                    self.tsdf_fusion.integrate_depth(
+                        anchor.tsdf,
+                        frame.mono_idepth,
+                        frame.mono_depth_conf,
+                        anchor.R_world_to_anchor,
+                        anchor.t_world_to_anchor,
+                        R_cam_to_world,
+                        t_cam_to_world,
+                        self.keyframe_store.f,
+                        self.keyframe_store.centre,
+                    )
                 self._spawn_anchor_local_gaussians(
                     anchor,
                     frame,
@@ -851,6 +1031,136 @@ class ProgressiveTrainer:
             else:
                 self.controller.mapping_errors.append(f"uncalibrated_dense_depth_skip:{frame.frame_id}")
         self._maybe_anchor_render_check(frame, anchor)
+        self._maybe_save_test_render(frame, keyframe, anchor)
+
+    @staticmethod
+    def _image_tensor_to_uint8(image: torch.Tensor) -> np.ndarray:
+        image = image.detach()
+        if image.ndim == 4:
+            image = image[0]
+        if image.ndim == 2:
+            image = image[None]
+        image = image[:3].clamp(0.0, 1.0)
+        if image.shape[0] == 1:
+            image = image.repeat(3, 1, 1)
+        return (image.permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
+
+    @staticmethod
+    def _gray_tensor_to_uint8(image: torch.Tensor) -> np.ndarray:
+        image = image.detach()
+        if image.ndim == 4:
+            image = image[0]
+        if image.ndim == 3:
+            image = image[0]
+        image = image.float().cpu()
+        finite = torch.isfinite(image)
+        if bool(finite.any()):
+            finite_vals = image[finite]
+            lo = torch.quantile(finite_vals, 0.02)
+            hi = torch.quantile(finite_vals, 0.98)
+            if float((hi - lo).abs()) < 1e-12:
+                hi = lo + 1.0
+            image = ((image - lo) / (hi - lo)).clamp(0.0, 1.0)
+            image = torch.where(finite, image, torch.zeros_like(image))
+        else:
+            image = torch.zeros_like(image)
+        return (image.numpy() * 255.0).round().astype(np.uint8)
+
+    @staticmethod
+    def _write_png(path: str, image: np.ndarray) -> None:
+        import struct
+        import zlib
+
+        image = np.asarray(image, dtype=np.uint8)
+        if image.ndim == 2:
+            height, width = image.shape
+            color_type = 0
+            raw = b"".join(b"\x00" + image[y].tobytes() for y in range(height))
+        elif image.ndim == 3 and image.shape[2] == 3:
+            height, width, _ = image.shape
+            color_type = 2
+            raw = b"".join(b"\x00" + image[y].tobytes() for y in range(height))
+        else:
+            raise ValueError(f"Unsupported PNG array shape: {image.shape}")
+
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            return (
+                struct.pack(">I", len(data))
+                + tag
+                + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+            )
+
+        payload = b"\x89PNG\r\n\x1a\n"
+        payload += chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0))
+        payload += chunk(b"IDAT", zlib.compress(raw, level=6))
+        payload += chunk(b"IEND", b"")
+        with open(path, "wb") as f:
+            f.write(payload)
+
+    @staticmethod
+    def _json_safe(value):
+        if torch.is_tensor(value):
+            if value.numel() == 1:
+                return value.detach().cpu().item()
+            return value.detach().cpu().tolist()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {str(k): ProgressiveTrainer._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [ProgressiveTrainer._json_safe(v) for v in value]
+        return value
+
+    @torch.no_grad()
+    def _maybe_save_test_render(self, frame, keyframe: TrackingKeyframe, anchor) -> None:
+        if not self.cfg.save_test_renders:
+            return
+        if not frame.info.get("is_test", False):
+            return
+        every = max(1, int(self.cfg.test_render_every))
+        if int(frame.frame_id) % every != 0:
+            return
+        if int(frame.frame_id) in self.saved_test_render_frames:
+            return
+        if anchor.gaussian_model.n <= 0:
+            return
+        with self.tracker.track("TestRenderSave"):
+            with self.controller.anchor_locks[anchor.anchor_id].read_lock():
+                result = self.anchor_scene_model.render_from_keyframe(keyframe, active_anchor_ids=[anchor.anchor_id])
+                debug = dict(self.anchor_scene_model.last_render_debug)
+        if result.cuda_error:
+            self.controller.mapping_errors.append(f"test_render_cuda:{frame.frame_id}:{result.cuda_error}")
+            return
+
+        out_dir = os.path.join(self.args.model_path, self.cfg.test_render_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        prefix = f"frame_{int(frame.frame_id):05d}_kf_{int(keyframe.index):05d}_anchor_{int(anchor.anchor_id):03d}"
+        render = result.render.detach().clamp(0.0, 1.0)
+        gt = frame.image.detach().to(render.device).clamp(0.0, 1.0)
+        error = (render - gt).abs().mean(dim=0, keepdim=True)
+
+        self._write_png(os.path.join(out_dir, f"{prefix}_render.png"), self._image_tensor_to_uint8(render))
+        self._write_png(os.path.join(out_dir, f"{prefix}_gt.png"), self._image_tensor_to_uint8(gt))
+        self._write_png(os.path.join(out_dir, f"{prefix}_abs_error.png"), self._gray_tensor_to_uint8(error))
+        self._write_png(os.path.join(out_dir, f"{prefix}_invdepth.png"), self._gray_tensor_to_uint8(result.invdepth))
+        metadata = {
+            "frame_id": int(frame.frame_id),
+            "keyframe_index": int(keyframe.index),
+            "anchor_id": int(anchor.anchor_id),
+            "image_name": frame.info.get("name", ""),
+            "num_anchor_gaussians": int(anchor.gaussian_model.n),
+            "mean_abs_error": float(error.mean().detach().cpu().item()),
+            "render_debug": debug,
+            "pose_initialization": frame.info.get("pose_initialization", {}),
+            "mono_depth_alignment": frame.info.get("mono_depth_alignment", {}),
+        }
+        with open(os.path.join(out_dir, f"{prefix}_meta.json"), "w") as f:
+            json.dump(self._json_safe(metadata), f, indent=2)
+        self.saved_test_render_frames.add(int(frame.frame_id))
+        print(f"[TestRender] saved frame={frame.frame_id} anchor={anchor.anchor_id} dir={out_dir}")
 
     @torch.no_grad()
     def _spawn_triangulated_keypoint_gaussians(
@@ -890,13 +1200,14 @@ class ProgressiveTrainer:
         )[0, :, 0, :].T.contiguous()
         n_new = xyz_local.shape[0]
         rest_dim = anchor.gaussian_model.params["f_rest"]["val"].shape[1]
-        scale = (depth / float(self.keyframe_store.f)).clamp(1e-5, 1.0)
+        world_scale = (depth / float(self.keyframe_store.f)).clamp(1e-5, 1.0)
+        local_scale = (world_scale / anchor.s_anchor_to_world.to(world_scale).clamp_min(1e-8)).clamp(1e-6, 1e6)
         extension = {
             "xyz": xyz_local.contiguous(),
             "f_dc": RGB2SH(colors[:, None, :]).contiguous(),
             "f_rest": torch.zeros(n_new, rest_dim, 3, device=xyz_local.device),
             "opacity": inverse_sigmoid(torch.full((n_new, 1), self.cfg.spawn_opacity_init, device=xyz_local.device)),
-            "scaling": torch.log(scale).unsqueeze(-1).repeat(1, 3).contiguous(),
+            "scaling": torch.log(local_scale).unsqueeze(-1).repeat(1, 3).contiguous(),
             "rotation": torch.zeros(n_new, 4, device=xyz_local.device),
         }
         extension["rotation"][:, 0] = 1
@@ -931,32 +1242,53 @@ class ProgressiveTrainer:
             rendered_image=rendered_image,
             rendered_invdepth=rendered_invdepth,
         )
-        if spawn.xyz_cam.shape[0] == 0:
+        if spawn.uv.shape[0] == 0:
             return
-        if spawn.xyz_cam.shape[0] > self.cfg.local_spawn_max:
-            keep = torch.randperm(spawn.xyz_cam.shape[0], device=spawn.xyz_cam.device)[: self.cfg.local_spawn_max]
-            xyz_cam = spawn.xyz_cam[keep]
+        if spawn.uv.shape[0] > self.cfg.local_spawn_max:
+            keep = torch.randperm(spawn.uv.shape[0], device=spawn.uv.device)[: self.cfg.local_spawn_max]
             f_dc = spawn.f_dc[keep]
-            depth = spawn.depth[keep]
             uv = spawn.uv[keep]
             sample_probability = spawn.init_probability[keep]
         else:
-            xyz_cam = spawn.xyz_cam
             f_dc = spawn.f_dc
-            depth = spawn.depth
             uv = spawn.uv
             sample_probability = spawn.init_probability
+        keyframe_index = int(frame.info.get("progressive_keyframe_index", -1))
+        keyframe = self.keyframe_store.by_index(keyframe_index)
+        if keyframe is None:
+            return
+        depth, valid_depth, mvs_stats = self._resolve_spawn_depths_with_mvs(keyframe, frame, uv, sample_probability)
+        if not valid_depth.any():
+            self.anchor_scene_model.last_render_debug["last_spawn"] = self._spawn_diagnostics(
+                anchor,
+                spawn,
+                uv,
+                torch.empty(0, device=uv.device),
+                torch.empty(0, 3, device=uv.device),
+                torch.empty(0, 3, device=uv.device),
+                torch.empty(0, dtype=torch.bool, device=uv.device),
+                R_cam_to_world,
+                t_cam_to_world,
+                extra_stats=mvs_stats,
+            )
+            return
+        uv = uv[valid_depth]
+        f_dc = f_dc[valid_depth]
+        depth = depth[valid_depth]
+        sample_probability = sample_probability[valid_depth]
+        xyz_cam = depth2points(uv, depth[:, None], self.keyframe_store.f, self.keyframe_store.centre)
         xyz_world = (R_cam_to_world @ xyz_cam.T).T + t_cam_to_world[None]
         xyz_local = anchor.world_to_local(xyz_world)
         n_new = xyz_local.shape[0]
         rest_dim = anchor.gaussian_model.params["f_rest"]["val"].shape[1]
-        scale = (depth / (float(self.keyframe_store.f) * torch.sqrt(sample_probability.clamp_min(1e-3)))).clamp(1e-6, 1e6)
+        world_scale = (depth / (float(self.keyframe_store.f) * torch.sqrt(sample_probability.clamp_min(1e-3)))).clamp(1e-6, 1e6)
+        local_scale = (world_scale / anchor.s_anchor_to_world.to(world_scale).clamp_min(1e-8)).clamp(1e-6, 1e6)
         extension = {
             "xyz": xyz_local.contiguous(),
             "f_dc": f_dc.contiguous(),
             "f_rest": torch.zeros(n_new, rest_dim, 3, device=xyz_local.device),
             "opacity": inverse_sigmoid(torch.full((n_new, 1), self.cfg.spawn_opacity_init, device=xyz_local.device)),
-            "scaling": torch.log(scale).unsqueeze(-1).repeat(1, 3).contiguous(),
+            "scaling": torch.log(local_scale).unsqueeze(-1).repeat(1, 3).contiguous(),
             "rotation": torch.zeros(n_new, 4, device=xyz_local.device),
         }
         extension["rotation"][:, 0] = 1
@@ -975,7 +1307,138 @@ class ProgressiveTrainer:
             finite,
             R_cam_to_world,
             t_cam_to_world,
+            extra_stats=mvs_stats,
         )
+
+    @torch.no_grad()
+    def _resolve_spawn_depths_with_mvs(
+        self,
+        keyframe: TrackingKeyframe,
+        frame,
+        uv: torch.Tensor,
+        sample_probability: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        mono_depth, mono_conf = self._sample_keyframe_mono_depth_and_conf(keyframe, uv)
+        mono_valid = (
+            torch.isfinite(mono_depth)
+            & (mono_depth > 1e-6)
+            & torch.isfinite(mono_conf)
+            & (mono_conf >= self.cfg.depth_conf_min)
+        )
+        mvs_depth = torch.full_like(mono_depth, -1.0)
+        accurate_mask = torch.zeros_like(mono_valid)
+        prev_keyframes = []
+        if self.guided_mvs is not None:
+            prev_keyframes = self.keyframe_store.get_prev_keyframes(
+                self.guided_mvs.n_cams + 1,
+                update_3dpts=False,
+                desc_kpts=frame.desc_kpts,
+            )
+            prev_keyframes = [kf for kf in prev_keyframes if int(kf.index) != int(keyframe.index)]
+            prev_keyframes = [
+                kf
+                for kf in prev_keyframes
+                if kf.feat_map is not None and torch.isfinite(kf.get_Rt()).all()
+            ][: self.guided_mvs.n_cams]
+        if (
+            self.guided_mvs is not None
+            and len(prev_keyframes) == self.guided_mvs.n_cams
+            and keyframe.feat_map is not None
+            and uv.numel() > 0
+        ):
+            try:
+                mvs_depth, accurate_mask = self.guided_mvs(uv.contiguous(), keyframe, prev_keyframes)
+            except Exception as exc:
+                self.controller.mapping_errors.append(f"guided_mvs_failed:{frame.frame_id}:{type(exc).__name__}")
+                mvs_depth = torch.full_like(mono_depth, -1.0)
+                accurate_mask = torch.zeros_like(mono_valid)
+
+        mvs_valid = torch.isfinite(mvs_depth) & (mvs_depth > 1e-6)
+        idepth_mvs = 1.0 / mvs_depth.clamp_min(1e-6)
+        idepth_mono = 1.0 / mono_depth.clamp_min(1e-6)
+        depth_consistent = (idepth_mvs - idepth_mono).abs() < float(self.cfg.mvs_depth_consistency_idepth)
+        reliable_mvs = mvs_valid & accurate_mask & depth_consistent
+        fallback_mono = (~reliable_mvs) & mono_valid
+        total = max(int(uv.shape[0]), 1)
+        reliable_count = int(reliable_mvs.sum().item())
+        mvs_ratio = float(reliable_count / total)
+        adaptive_fraction = self._adaptive_mono_fallback_fraction(
+            mvs_ratio,
+            self.cfg.mvs_mono_fallback_fraction,
+            self.cfg.mvs_mono_fallback_max_fraction,
+            self.cfg.mvs_target_ratio,
+        )
+        cap_before_valid = max(
+            int(round(adaptive_fraction * float(total))),
+            max(0, int(self.cfg.mono_fallback_min_points)),
+        )
+        fallback_available = int(fallback_mono.sum().item())
+        max_fallback = min(cap_before_valid, fallback_available)
+        if max_fallback <= 0:
+            fallback_mono &= False
+        elif fallback_available > max_fallback:
+            scores = (mono_conf * sample_probability.to(mono_conf.device)).masked_fill(~fallback_mono, -1.0)
+            keep_idx = torch.topk(scores, k=max_fallback, largest=True).indices
+            capped = torch.zeros_like(fallback_mono)
+            capped[keep_idx] = True
+            fallback_mono = capped
+
+        valid = reliable_mvs | fallback_mono
+        depth = torch.where(reliable_mvs, mvs_depth, mono_depth)
+        stats = {
+            "sampled_before_mvs": int(uv.shape[0]),
+            "prev_keyframes_used": int(len(prev_keyframes)),
+            "reliable_mvs": int(reliable_count),
+            "fallback_mono": int(fallback_mono.sum().item()),
+            "mvs_valid": int(mvs_valid.sum().item()),
+            "mvs_accurate": int(accurate_mask.sum().item()),
+            "depth_consistent": int(depth_consistent.sum().item()),
+            "mono_valid": int(mono_valid.sum().item()),
+            "mvs_ratio": float(mvs_ratio),
+            "mono_fallback_ratio": float(fallback_mono.float().sum().item() / total),
+            "depth_consistent_ratio": float(depth_consistent.float().sum().item() / total),
+            "mono_fallback_cap": int(max_fallback),
+            "mono_fallback_base_fraction": float(max(0.0, min(1.0, float(self.cfg.mvs_mono_fallback_fraction)))),
+            "mono_fallback_adaptive_fraction": float(adaptive_fraction),
+            "mono_fallback_max_fraction": float(max(0.0, min(1.0, float(self.cfg.mvs_mono_fallback_max_fraction)))),
+            "mvs_target_ratio": float(max(0.0, float(self.cfg.mvs_target_ratio))),
+            "mono_fallback_min_points": int(self.cfg.mono_fallback_min_points),
+            "mono_fallback_cap_before_valid_count": int(cap_before_valid),
+        }
+        return depth, valid, stats
+
+    @staticmethod
+    def _adaptive_mono_fallback_fraction(
+        mvs_ratio: float,
+        base_fraction: float,
+        max_fraction: float,
+        target_mvs_ratio: float,
+    ) -> float:
+        base = max(0.0, min(1.0, float(base_fraction)))
+        max_allowed = max(base, min(1.0, float(max_fraction)))
+        target = max(float(target_mvs_ratio), 1e-8)
+        ratio = max(0.0, min(1.0, float(mvs_ratio)))
+        shortage = max(0.0, min(1.0, (target - ratio) / target))
+        return float(base + (max_allowed - base) * shortage)
+
+    @torch.no_grad()
+    def _sample_keyframe_mono_depth_and_conf(self, keyframe: TrackingKeyframe, uv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if uv.numel() == 0:
+            return torch.empty(0, device=keyframe.device), torch.empty(0, device=keyframe.device)
+        sampler = make_torch_sampler(uv.view(1, 1, -1, 2), keyframe.width, keyframe.height)
+        mono_idepth = torch.nn.functional.grid_sample(
+            keyframe.get_mono_idepth()[None],
+            sampler,
+            mode="bilinear",
+            align_corners=True,
+        )[0, 0, 0]
+        mono_conf = torch.nn.functional.grid_sample(
+            keyframe.mono_depth_conf,
+            sampler,
+            mode="bilinear",
+            align_corners=True,
+        )[0, 0, 0]
+        return 1.0 / mono_idepth.clamp_min(1e-6), mono_conf
 
     @torch.no_grad()
     def _spawn_diagnostics(
@@ -989,8 +1452,11 @@ class ProgressiveTrainer:
         finite: torch.Tensor,
         R_cam_to_world: torch.Tensor,
         t_cam_to_world: torch.Tensor,
+        extra_stats: dict | None = None,
     ) -> dict:
         stats = dict(getattr(spawn, "stats", {}))
+        if extra_stats:
+            stats.update(extra_stats)
         stats["kept_after_cap"] = int(uv.shape[0])
         stats["finite_after_transform"] = int(finite.sum().item()) if finite.numel() else 0
         diag_mask = finite & torch.isfinite(xyz_world).all(dim=1) & torch.isfinite(xyz_local).all(dim=1)
@@ -1071,6 +1537,8 @@ class ProgressiveTrainer:
                     f"spawned={spawn_debug.get('spawned', 0)} "
                     f"kept={spawn_debug.get('kept_after_cap', 0)} "
                     f"finite={spawn_debug.get('finite_after_transform', 0)} "
+                    f"mvs={spawn_debug.get('mvs_ratio', 0.0):.3f} "
+                    f"mono_fb={spawn_debug.get('mono_fallback_ratio', 0.0):.3f} "
                     f"tsdf_valid={spawn_debug.get('tsdf_valid_ratio', 0.0):.3f} "
                     f"reproj_p95={spawn_debug.get('reprojection_error_p95_px', 0.0):.3f}px "
                     f"depth_med={spawn_debug.get('camera_depth_median', 0.0):.3f}"
@@ -1125,10 +1593,14 @@ class ProgressiveTrainer:
         stats = {
             "method": "triangulated_keypoint_median_inverse_depth_scale",
             "num_candidates": int(valid.sum().item()),
+            "triangulated_points": int(valid.sum().item()),
             "required": int(self.cfg.depth_scale_min_samples),
             "calibrated": False,
+            "depth_scale_method": "uncalibrated",
         }
         if int(valid.sum().item()) < int(self.cfg.depth_scale_min_samples):
+            if self._inherit_recent_depth_scale(keyframe, stats):
+                return
             keyframe.frame.info["mono_depth_alignment"] = stats
             keyframe.frame.info["mono_depth_calibrated"] = False
             return
@@ -1157,14 +1629,25 @@ class ProgressiveTrainer:
         )
         if int(ratio_valid.sum().item()) < int(self.cfg.depth_scale_min_samples):
             stats["num_valid_ratios"] = int(ratio_valid.sum().item())
+            if self._inherit_recent_depth_scale(keyframe, stats):
+                return
             keyframe.frame.info["mono_depth_alignment"] = stats
             keyframe.frame.info["mono_depth_calibrated"] = False
             return
 
         ratios = ratios[ratio_valid].float()
-        q10 = torch.quantile(ratios, 0.10)
-        q90 = torch.quantile(ratios, 0.90)
-        robust = ratios[(ratios >= q10) & (ratios <= q90)]
+        if ratios.numel() < 8:
+            median = ratios.median()
+            mad = (ratios - median).abs().median().clamp_min(1e-8)
+            robust = ratios[(ratios - median).abs() <= 5.0 * mad]
+            q10 = ratios.min()
+            q90 = ratios.max()
+            filter_name = "median_5mad"
+        else:
+            q10 = torch.quantile(ratios, 0.10)
+            q90 = torch.quantile(ratios, 0.90)
+            robust = ratios[(ratios >= q10) & (ratios <= q90)]
+            filter_name = "q10_q90"
         if robust.numel() == 0:
             robust = ratios
         scale = robust.median().clamp(
@@ -1178,12 +1661,41 @@ class ProgressiveTrainer:
                 "num_valid_ratios": int(ratios.numel()),
                 "num_robust_ratios": int(robust.numel()),
                 "scale": float(scale.detach().item()),
+                "depth_scale_method": "direct_calibrated",
+                "robust_filter": filter_name,
                 "ratio_q10": float(q10.detach().item()),
                 "ratio_q90": float(q90.detach().item()),
             }
         )
         keyframe.frame.info["mono_depth_alignment"] = stats
         keyframe.frame.info["mono_depth_calibrated"] = True
+
+    def _inherit_recent_depth_scale(self, keyframe: TrackingKeyframe, stats: dict) -> bool:
+        for prev in reversed(self.keyframe_store.keyframes[:-1]):
+            prev_stats = prev.frame.info.get("mono_depth_alignment", {})
+            if not prev.frame.info.get("mono_depth_calibrated", False):
+                continue
+            scale = prev_stats.get("scale", None)
+            if scale is None:
+                continue
+            scale_t = torch.as_tensor(scale, dtype=keyframe.mono_idepth.dtype, device=keyframe.device)
+            if not torch.isfinite(scale_t).all() or float(scale_t.item()) <= 0:
+                continue
+            keyframe.apply_mono_idepth_calibration(scale_t)
+            stats.update(
+                {
+                    "calibrated": True,
+                    "depth_scale_method": "inherited",
+                    "inherited_depth_scale": True,
+                    "scale": float(scale_t.detach().cpu().item()),
+                    "source_keyframe_index": int(prev.index),
+                    "source_frame_id": int(prev.frame.frame_id),
+                }
+            )
+            keyframe.frame.info["mono_depth_alignment"] = stats
+            keyframe.frame.info["mono_depth_calibrated"] = True
+            return True
+        return False
 
     def _make_keyframe(self, frame, Rt, index: int, focal) -> TrackingKeyframe:
         if frame is None:
@@ -1238,6 +1750,18 @@ class ProgressiveTrainer:
         if self.cfg.async_mapping:
             self.controller.mapping_queue.join()
             self.controller.stop_mapping_worker()
+        if self.cfg.tsdf_fusion_mode == "delayed_gaussian":
+            for anchor in self.controller.anchors:
+                with self.tracker.track("DelayedTSDFFinal"):
+                    stats = self._integrate_delayed_tsdf(anchor)
+                if int(stats.get("integrated", 0)) > 0:
+                    self.anchor_seal_events.append(
+                        {
+                            "anchor_id": int(anchor.anchor_id),
+                            "reasons": ["finalize_delayed_tsdf"],
+                            "delayed_tsdf": stats,
+                        }
+                    )
         print("Saving the Progressive reconstruction to:", self.args.model_path)
         metrics = self.anchor_scene_model.save(
             self.args.model_path,

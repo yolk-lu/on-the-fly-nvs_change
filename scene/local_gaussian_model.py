@@ -83,16 +83,21 @@ class LocalGaussianModel:
 
     @staticmethod
     def rotate_quaternions_world(q_local: torch.Tensor, R_anchor_to_world: torch.Tensor) -> torch.Tensor:
-        # First version preserves stored quaternion if local covariance rotation
-        # is not requested by the caller. AnchorLocalMap handles covariance-level
-        # rotation explicitly for loop-closure pose updates.
-        del R_anchor_to_world
         norm = torch.linalg.vector_norm(q_local, dim=-1, keepdim=True).clamp_min(1e-8)
         q = q_local / norm
         identity = torch.zeros_like(q)
         if identity.numel() > 0:
             identity[:, 0] = 1
-        return torch.where(torch.isfinite(q).all(dim=-1, keepdim=True), q, identity)
+        valid = torch.isfinite(q).all(dim=-1, keepdim=True)
+        valid &= torch.linalg.vector_norm(q_local, dim=-1, keepdim=True) > 1e-8
+        q = torch.where(valid, q, identity)
+
+        # The anchor rotation is constant for a local optimization step. Compose
+        # it in quaternion space so identity local Gaussians do not backpropagate
+        # through the singular sqrt branch of a matrix-to-quaternion conversion.
+        R_anchor = R_anchor_to_world.to(device=q.device, dtype=q.dtype)
+        q_anchor = matrix_to_quaternion(R_anchor).detach()
+        return quaternion_multiply(q_anchor, q)
 
     def finite_mask(self) -> torch.Tensor:
         if self.n == 0:
@@ -126,14 +131,39 @@ def quaternion_to_matrix(q: torch.Tensor) -> torch.Tensor:
 
 
 def matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
-    # Stable enough for covariance rotation tests; assumes R is close to SO(3).
-    trace = R.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
-    qw = torch.sqrt((1.0 + trace).clamp_min(1e-8)) * 0.5
-    denom = (4.0 * qw).clamp_min(1e-8)
-    qx = (R[..., 2, 1] - R[..., 1, 2]) / denom
-    qy = (R[..., 0, 2] - R[..., 2, 0]) / denom
-    qz = (R[..., 1, 0] - R[..., 0, 1]) / denom
-    return F.normalize(torch.stack([qw, qx, qy, qz], dim=-1), dim=-1)
+    # Assumes R is close to SO(3). The signed-root form stays defined for
+    # rotations whose trace is near -1, unlike the trace-only formula.
+    m00 = R[..., 0, 0]
+    m11 = R[..., 1, 1]
+    m22 = R[..., 2, 2]
+    qw = 0.5 * torch.sqrt((1.0 + m00 + m11 + m22).clamp_min(0.0))
+    qx = 0.5 * torch.sqrt((1.0 + m00 - m11 - m22).clamp_min(0.0))
+    qy = 0.5 * torch.sqrt((1.0 - m00 + m11 - m22).clamp_min(0.0))
+    qz = 0.5 * torch.sqrt((1.0 - m00 - m11 + m22).clamp_min(0.0))
+    qx = torch.copysign(qx, R[..., 2, 1] - R[..., 1, 2])
+    qy = torch.copysign(qy, R[..., 0, 2] - R[..., 2, 0])
+    qz = torch.copysign(qz, R[..., 1, 0] - R[..., 0, 1])
+    q = F.normalize(torch.stack([qw, qx, qy, qz], dim=-1), dim=-1)
+    identity = torch.zeros_like(q)
+    if identity.numel() > 0:
+        identity[..., 0] = 1
+    return torch.where(torch.isfinite(q).all(dim=-1, keepdim=True), q, identity)
+
+
+def quaternion_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Hamilton product for wxyz quaternions."""
+    lw, lx, ly, lz = left.unbind(dim=-1)
+    rw, rx, ry, rz = right.unbind(dim=-1)
+    product = torch.stack(
+        [
+            lw * rw - lx * rx - ly * ry - lz * rz,
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+        ],
+        dim=-1,
+    )
+    return F.normalize(product, dim=-1)
 
 
 def covariance_from_scaling_rotation(log_scaling: torch.Tensor, quaternion: torch.Tensor) -> torch.Tensor:

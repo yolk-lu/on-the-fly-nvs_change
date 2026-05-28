@@ -22,7 +22,7 @@
 
 也就是說，目前我們的新 pipeline 不再從舊 `train.py` 或 `train_lod.py` 執行。若直接執行舊 `train.py`，會走原本舊架構，不是本文記錄的 progressive pipeline。
 
-本階段不使用 `viewer`、`VGGT pose prior`、`LSF velocity gate`。這三者不再由 `run_plan_training_full.sh` 傳入，也不屬於 progressive 專屬 config 的可調主參數。
+本階段不使用 `viewer` 與 `LSF velocity gate`。`run_plan_training_full.sh` 預設啟用 `VGGT pose prior` 以抑制單目尺度坍塌，預設讀取 `trajectory_output/vggt_camera_params.csv`；需要純 SfM baseline 時以 `USE_VGGT_POSE_PRIOR=0` 關閉。
 
 執行順序：
 
@@ -48,7 +48,7 @@ run_plan_training_full.sh
   - 解析 `--progressive_anchor_radius`
   - 解析 `--progressive_anchor_min_keyframes`
   - 解析 `--progressive_async_mapping`
-  - 解析 `--progressive_tsdf_loss_weight`
+  - 解析 `--progressive_tsdf_loss_weight`，目前預設 `0.0`，只保留接口
   - 解析 `--progressive_anisotropy_loss_weight`
   - 解析 `--progressive_local_spawn_max`
   - 解析 `--progressive_local_spawn_target`
@@ -95,7 +95,7 @@ main()
 - `self.controller`
 - `self.anchor_scene_model`
 - `self.loop_manager`
-- `self.tsdf_fusion`
+- `self.tsdf_fusion`：目前為 no-op compatibility interface，不再執行 TSDF fusion
 - `self.spawn_policy`
 - `self.pending_pose_queue`
 - `self.bootstrap_frames`
@@ -324,7 +324,7 @@ self.anchor_scene_model = ProgressiveSceneModel(
     sh_degree=self.args.sh_degree,
     lambda_dssim=self.args.lambda_dssim,
     depth_loss_weight=self.args.depth_loss_weight_init,
-    tsdf_loss_weight=self.cfg.tsdf_loss_weight,
+    tsdf_loss_weight=self.cfg.tsdf_loss_weight,  # TSDF disabled by default; interface only
     anisotropy_loss_weight=self.cfg.anisotropy_loss_weight,
     max_gaussian_aspect_ratio=...,
     lr_by_name={...},
@@ -658,7 +658,7 @@ self.controller.anchor_budget_status(
 
 - `num_gaussians >= max_anchor_gaussians`
 - `num_keyframes >= max_anchor_keyframes`
-- `num_tsdf_voxels >= max_anchor_tsdf_voxels`
+- `num_tsdf_voxels >= max_anchor_tsdf_voxels`；目前 TSDF backend 已移除且預設 `max_anchor_tsdf_voxels=0`，此條件只作相容保留
 - `gpu_used_mb >= max_anchor_vram_mb`，若 `max_anchor_vram_mb > 0`
 - `distance(camera_center, anchor_origin) > anchor_radius` 且 `num_keyframes >= anchor_min_keyframes`
 
@@ -810,7 +810,7 @@ with self.controller.anchor_locks[anchor.anchor_id].write_lock():
     ...
 ```
 
-5. 融合 depth 到 local TSDF：
+5. TSDF fusion 接口保留但目前不融合 depth：
 
 ```python
 self.tsdf_fusion.integrate_depth(
@@ -826,14 +826,7 @@ self.tsdf_fusion.integrate_depth(
 )
 ```
 
-`TSDFFusion.integrate_depth(...)` 會：
-
-- 將 monocular inverse depth 轉成 depth samples
-- 使用 confidence gate
-- 建立 camera-space points
-- 轉到 world space
-- 再轉到 anchor-local space
-- 呼叫 `AdaptiveTSDF.integrate(...)`
+`TSDFFusion.integrate_depth(...)` 目前是 no-op。`AdaptiveTSDF` 仍提供 `keys`、`query(...)`、`integrate_samples(...)` 等歷史接口，但不再建立 voxel 或回傳 valid TSDF sample。
 
 6. 生成 anchor-local Gaussians。若 active anchor 已有 Gaussian，會先從目前 keyframe render 一次，作為 spawn penalty / occlusion reference：
 
@@ -951,7 +944,7 @@ anchor.gaussian_model.append(extension, anchor.anchor_id)
 - `kept_after_cap`：套用 `local_spawn_max` 後實際保留數
 - `finite_after_transform`：轉成 world / anchor-local 後仍 finite 的數量
 - `reprojection_error_p95_px`：`uv -> xyz_cam -> world -> camera -> uv` 的 95% re-projection error，用來確認點是否真的放在輸入影像射線上
-- `tsdf_valid_ratio`：新增點落在已觀測 TSDF voxel 的比例，用來確認是否貼近 TSDF physical surface
+- `tsdf_valid_ratio`：TSDF backend 移除後保留欄位，值不再代表 physical surface 約束
 - `camera_depth_median`：新增點回到目前 camera frame 後的 depth median，用來檢查 monocular depth scale 是否爆掉
 
 ## 12. Anchor Render / Loss / Optimization
@@ -1072,6 +1065,8 @@ depth_loss = abs(invdepth[valid_depth] - mono_idepth[valid_depth]).mean()
 tsdf_loss, anisotropy_loss = self.anchor_regularization_losses()
 ```
 
+目前 `tsdf_loss` 由 compatibility layer 回傳 zero tensor，實際正則只剩 anisotropy。
+
 6. 合成 total loss：
 
 ```python
@@ -1079,7 +1074,7 @@ total =
     lambda_dssim * ssim_loss
     + (1 - lambda_dssim) * rgb_loss
     + depth_loss_weight * depth_loss
-    + tsdf_loss_weight * tsdf_loss
+    + tsdf_loss_weight * tsdf_loss  # default 0.0 / no-op
     + anisotropy_loss_weight * anisotropy_loss
 ```
 
@@ -1450,7 +1445,7 @@ colmap/images.bin
 
 ### 18.2 TSDF State
 
-每個 anchor 會保存：
+每個 anchor 仍會保存 placeholder TSDF state，以維持舊輸出格式與載入接口；tensor 預期為 empty：
 
 - `base_voxel_size`
 - `num_levels`
@@ -1503,7 +1498,7 @@ write_model(cameras, images, {}, colmap_save_path, ext=".bin")
 
 目前保留但尚未實作完整功能：
 
-- `overlap optimization` 仍是 reserved
+- `overlap optimization` 仍是 reserved；實作規格見 `Overlap_Joint_Optimization_Plan.md`
 - `Pose Graph Optimization` 已有 `Sim(3)` 第一版，但只有 verified loop edge 後才會觸發
 - viewer 不納入目前 progressive pipeline
 - full global evaluation path 尚未接回 progressive pipeline
@@ -1556,7 +1551,7 @@ run_plan_training_full.sh
                       -> LoopClosureManager.check_anchor_rollover()
                       -> ReconstructionController.verify_and_add_loop_edge()
                     -> _mapping_step()
-                      -> TSDFFusion.integrate_depth()
+                      -> TSDFFusion.integrate_depth()  # no-op compatibility interface
                       -> _spawn_anchor_local_gaussians()
                         -> GaussianSpawnPolicy.sample()
                       -> _maybe_anchor_render_check()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 
 import torch
 
@@ -61,6 +62,7 @@ class AnchorLocalRenderer:
         self.max_depth = float(max_depth)
         self.max_rasterized_gaussians = int(max_rasterized_gaussians)
         self.z_near = 0.01
+        self.z_far = 100.0
         self.update_intrinsics(f)
 
     def update_intrinsics(self, f: torch.Tensor | float) -> None:
@@ -70,11 +72,11 @@ class AnchorLocalRenderer:
         self.tanfovx = math.tan(self.fov_x * 0.5)
         self.tanfovy = math.tan(self.fov_y * 0.5)
         self.projection_matrix = (
-            getProjectionMatrix(znear=0.01, zfar=100.0, fovX=self.fov_x, fovY=self.fov_y)
+            getProjectionMatrix(znear=self.z_near, zfar=self.z_far, fovX=self.fov_x, fovY=self.fov_y)
             .transpose(0, 1)
             .to(self.device)
         )
-        self.guard = RenderGuard(self.f, max_screen_px=self.max_screen_px, max_depth=self.max_depth)
+        self.guard = RenderGuard(self.f, max_screen_px=self.max_screen_px, max_depth=min(self.max_depth, self.z_far))
 
     def collect_anchor_batch(self, anchors: list[AnchorLocalMap]) -> AnchorRenderBatch:
         non_empty = [anchor for anchor in anchors if anchor.gaussian_model.n > 0]
@@ -155,6 +157,8 @@ class AnchorLocalRenderer:
             )
 
         params = self._sanitize_raster_params(kept_batch.params)
+        if os.environ.get("OTFNVS_RENDER_DEBUG", "0") == "1":
+            self._print_raster_debug(kept_batch, params, view_matrix)
         screenspace_points = torch.zeros_like(params["xyz"], requires_grad=True)
         raster_settings = GaussianRasterizationSettings(
             self.height,
@@ -280,7 +284,7 @@ class AnchorLocalRenderer:
         xyz_cam = xyz @ view_matrix[:3, :3] + view_matrix[3:4, :3]
         z = xyz_cam[:, 2]
         finite_cam = torch.isfinite(xyz_cam).all(dim=-1)
-        valid_depth = finite_cam & torch.isfinite(z) & (z > self.z_near) & (z < self.max_depth)
+        valid_depth = finite_cam & torch.isfinite(z) & (z > self.z_near) & (z < min(self.max_depth, self.z_far))
         z_safe = z.clamp_min(self.z_near)
         u = self.f * (xyz_cam[:, 0] / z_safe) + (self.width - 1) * 0.5
         v = self.f * (xyz_cam[:, 1] / z_safe) + (self.height - 1) * 0.5
@@ -314,3 +318,30 @@ class AnchorLocalRenderer:
         out = {key: value for key, value in params.items()}
         out["rotation"] = rotation.contiguous()
         return out
+
+    @torch.no_grad()
+    def _print_raster_debug(
+        self,
+        batch: AnchorRenderBatch,
+        params: dict[str, torch.Tensor],
+        view_matrix: torch.Tensor,
+    ) -> None:
+        xyz_cam = params["xyz"] @ view_matrix[:3, :3] + view_matrix[3:4, :3]
+        scale = torch.exp(params["scaling"].clamp(-20.0, 20.0)).max(dim=-1).values
+        opacity = params["opacity"].sigmoid().flatten()
+        anchor_ids = torch.unique(batch.anchor_ids.detach()).cpu().tolist()
+        print(
+            "[RasterDebug] "
+            f"anchors={anchor_ids} n={batch.n} "
+            f"xyz_shape={tuple(params['xyz'].shape)} f_rest_shape={tuple(params['f_rest'].shape)} "
+            f"z=({float(xyz_cam[:, 2].min().item()):.4g},"
+            f"{float(xyz_cam[:, 2].median().item()):.4g},"
+            f"{float(xyz_cam[:, 2].max().item()):.4g}) "
+            f"scale=({float(scale.min().item()):.4g},"
+            f"{float(scale.median().item()):.4g},"
+            f"{float(scale.max().item()):.4g}) "
+            f"opacity=({float(opacity.min().item()):.4g},"
+            f"{float(opacity.median().item()):.4g},"
+            f"{float(opacity.max().item()):.4g})",
+            flush=True,
+        )

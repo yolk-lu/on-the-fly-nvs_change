@@ -31,6 +31,7 @@ def run_smoke(device: str | torch.device = "cuda") -> dict:
     guard_result = guard.filter(params, torch.zeros(3, device=device))
     return {
         "tsdf_valid": int(query.valid.sum().item()),
+        "tsdf_voxels": int(tsdf.keys.shape[0]),
         "anchor_positive_cov": int(anchor.covariance_positive_mask().sum().item()),
         "render_guard_kept": int(guard_result.mask.sum().item()),
     }

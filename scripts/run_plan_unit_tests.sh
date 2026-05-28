@@ -46,9 +46,11 @@ COMPILE_TARGETS=(
   scene/anchor_graph.py
   scene/anchor_chunk_manager.py
   scene/anchor_local_map.py
+  tools/test_dinov2_gaussian_spawn.py
   tests/test_parallax_geometry.py
   tests/test_parallax_mini_ba.py
   tests/test_adaptive_tsdf.py
+  tests/test_tsdf_fusion.py
   tests/test_anchor_local_map.py
   tests/test_anchor_pose_graph_optimizer.py
   tests/test_gaussian_spawn_policy.py
@@ -69,6 +71,7 @@ PYTEST_TARGETS=(
   tests/test_parallax_geometry.py
   tests/test_parallax_mini_ba.py
   tests/test_adaptive_tsdf.py
+  tests/test_tsdf_fusion.py
   tests/test_anchor_local_map.py
   tests/test_anchor_pose_graph_optimizer.py
   tests/test_gaussian_spawn_policy.py

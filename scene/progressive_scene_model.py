@@ -85,7 +85,20 @@ class ProgressiveSceneModel:
 
     def render_from_keyframe(self, keyframe, active_anchor_ids: list[int] | None = None) -> AnchorRenderResult:
         view_matrix = keyframe.get_Rt().transpose(0, 1)
-        return self.render(view_matrix, keyframe.get_centre(approx=True), active_anchor_ids=active_anchor_ids)
+        result = self.render(view_matrix, keyframe.get_centre(approx=True), active_anchor_ids=active_anchor_ids)
+        self._update_keyframe_latest_invdepth(keyframe, result)
+        return result
+
+    def _update_keyframe_latest_invdepth(self, keyframe, result: AnchorRenderResult) -> None:
+        if result.cuda_error:
+            return
+        invdepth = result.invdepth.detach()
+        if invdepth.ndim == 2:
+            invdepth = invdepth[None]
+        if not torch.isfinite(invdepth).any():
+            return
+        keyframe.latest_invdepth = invdepth.contiguous()
+        self.last_render_debug["latest_invdepth_updated"] = True
 
     def render(
         self,
@@ -178,7 +191,8 @@ class ProgressiveSceneModel:
         full_loss = (diff * mask3).sum() / denom
         visible3 = visible_mask.expand_as(diff)
         if visible3.any():
-            visible_loss = diff[visible3].mean()
+            visible_weight_mask = visible3.to(dtype=diff.dtype)
+            visible_loss = (diff * visible_weight_mask).sum() / visible_weight_mask.sum().clamp_min(1.0)
             visible_weight = min(max(self.rgb_visible_weight, 0.0), 1.0)
             return visible_weight * visible_loss + (1.0 - visible_weight) * full_loss
         return full_loss
@@ -214,20 +228,24 @@ class ProgressiveSceneModel:
             return None
         optimizer = self._optimizer_for_anchor(anchor)
         optimizer.zero_grad(set_to_none=True)
-        per_view_losses = [
-            self.loss_from_keyframe(kf, frame, active_anchor_ids=[anchor.anchor_id])
-            for kf, frame in view_items
-        ]
-        totals = torch.stack([loss.total for loss in per_view_losses])
-        total_loss = totals.mean()
-        if not torch.isfinite(total_loss.detach()).all():
-            self.last_render_debug["nonfinite_loss"] = True
-            return None
-        if not total_loss.requires_grad:
-            self.last_render_debug["loss_without_grad"] = True
-            return self._loss_stats(self._average_losses(per_view_losses))
+        loss_summaries: list[dict[str, float]] = []
+        n_views = int(len(view_items))
+        saw_grad = False
         try:
-            total_loss.backward()
+            for kf, frame in view_items:
+                loss = self.loss_from_keyframe(kf, frame, active_anchor_ids=[anchor.anchor_id])
+                if not torch.isfinite(loss.total.detach()).all():
+                    self.last_render_debug["nonfinite_loss"] = True
+                    optimizer.zero_grad(set_to_none=True)
+                    return None
+                loss_summaries.append(self._loss_summary(loss))
+                if loss.total.requires_grad:
+                    saw_grad = True
+                    (loss.total / max(n_views, 1)).backward()
+                del loss
+            if not saw_grad:
+                self.last_render_debug["loss_without_grad"] = True
+                return self._average_loss_stats(loss_summaries)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             grad_stats = self._grad_stats(anchor)
@@ -244,8 +262,7 @@ class ProgressiveSceneModel:
                 torch.cuda.empty_cache()
             return None
         self._sanitize_anchor_params(anchor)
-        losses = self._average_losses(per_view_losses)
-        stats = self._loss_stats(losses)
+        stats = self._average_loss_stats(loss_summaries)
         stats.update(grad_stats)
         stats["num_views"] = int(len(view_items))
         self.last_render_debug["num_optimization_views"] = int(len(view_items))
@@ -286,13 +303,13 @@ class ProgressiveSceneModel:
                 continue
             points_local = params["xyz"]["val"]
             tsdf_loss = tsdf_surface_loss(points_local, anchor.tsdf)
-            query = anchor.tsdf.query(points_local)
-            tsdf_mask = query.valid & (query.weight >= 1.0)
-            if tsdf_mask.any():
-                voxel_size = anchor.tsdf.base_voxel_size
-                voxel_keys = torch.floor(points_local[tsdf_mask] / voxel_size).detach()
-                voxel_centres = (voxel_keys + 0.5) * voxel_size
-                tsdf_loss = tsdf_loss + 0.01 * (points_local[tsdf_mask] - voxel_centres).square().sum(dim=-1).mean()
+            # query = anchor.tsdf.query(points_local)
+            # tsdf_mask = query.valid & (query.weight >= 1.0)
+            # if tsdf_mask.any():
+            #     voxel_size = anchor.tsdf.base_voxel_size
+            #     voxel_keys = torch.floor(points_local[tsdf_mask] / voxel_size).detach()
+            #     voxel_centres = (voxel_keys + 0.5) * voxel_size
+            #     tsdf_loss = tsdf_loss + 0.01 * (points_local[tsdf_mask] - voxel_centres).square().sum(dim=-1).mean()
             total_tsdf = total_tsdf + tsdf_loss
             total_anisotropy = total_anisotropy + anisotropy_regularization(
                 params["scaling"]["val"], max_ratio=self.max_gaussian_aspect_ratio
@@ -318,6 +335,28 @@ class ProgressiveSceneModel:
             render_coverage=torch.stack([loss.render_coverage for loss in losses]).mean(),
             ssim_weight=torch.stack([loss.ssim_weight for loss in losses]).mean(),
         )
+
+    @staticmethod
+    def _loss_summary(loss: ProgressiveLoss) -> dict[str, float]:
+        return {
+            "total": float(loss.total.detach().cpu().item()),
+            "l1": float(loss.rgb.detach().cpu().item()),
+            "ssim": float(loss.ssim.detach().cpu().item()),
+            "depth": float(loss.depth.detach().cpu().item()),
+            "tsdf": float(loss.tsdf.detach().cpu().item()),
+            "anisotropy": float(loss.anisotropy.detach().cpu().item()),
+            "depth_valid_pixels": float(loss.depth_valid_pixels.detach().cpu().item()),
+            "visible_gaussians": float(loss.visible_gaussians.detach().cpu().item()),
+            "render_coverage": float(loss.render_coverage.detach().cpu().item()),
+            "ssim_weight": float(loss.ssim_weight.detach().cpu().item()),
+        }
+
+    @staticmethod
+    def _average_loss_stats(losses: list[dict[str, float]]) -> dict:
+        if len(losses) == 0:
+            return {}
+        keys = losses[0].keys()
+        return {key: float(sum(row[key] for row in losses) / len(losses)) for key in keys}
 
     def state_summary(self) -> dict:
         anchor_summaries = []
@@ -378,6 +417,7 @@ class ProgressiveSceneModel:
                     "keyframe_ids": list(anchor.keyframe_ids),
                     "num_gaussians": anchor.gaussian_model.n,
                     "num_tsdf_voxels": int(anchor.tsdf.keys.shape[0]),
+                    "delayed_tsdf": dict(getattr(anchor, "_delayed_tsdf_stats", {})),
                 }
                 for anchor in self.controller.anchors
             ],

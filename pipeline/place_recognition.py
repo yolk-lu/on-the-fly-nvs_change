@@ -16,6 +16,19 @@ class AnchorRetrievalCandidate:
     keyframe_index: int
 
 
+@dataclass
+class RelocalizationCandidate:
+    anchor_id: int
+    keyframe_index: int
+    frame_id: int
+    score: float
+    threshold: float
+    triangulated_points: int
+    camera_centre: list[float]
+    descriptor_backend: str
+    vlad_ready: bool
+
+
 class DINOv2GlobalDescriptorExtractor:
     """
     DINOv2-backed global descriptor extractor with a deterministic pooled-token
@@ -34,13 +47,23 @@ class DINOv2GlobalDescriptorExtractor:
         self.descriptor_dim = int(descriptor_dim)
         self.aggregator = aggregator or VLADAggregator(num_clusters=8, descriptor_dim=self.descriptor_dim)
         self.model = None
+        self.requested_dinov2 = bool(use_dinov2)
+        self.last_backend = "fallback"
         if use_dinov2:
             self.model = self._load_dinov2()
+        self.last_backend = "dinov2" if self.model is not None else "fallback"
 
     @torch.no_grad()
     def extract(self, image: torch.Tensor) -> torch.Tensor:
         tokens = self.extract_tokens(image)
-        descriptor = self.aggregator.encode(tokens)
+        return self.descriptor_from_tokens(tokens)
+
+    @torch.no_grad()
+    def descriptor_from_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.aggregator.is_ready:
+            descriptor = self.aggregator.encode(tokens)
+        else:
+            descriptor = self.mean_pool_descriptor(tokens)
         return F.normalize(descriptor.flatten(), dim=0)
 
     @torch.no_grad()
@@ -55,6 +78,7 @@ class DINOv2GlobalDescriptorExtractor:
                     features = self.model.forward_features(resized)
                     tokens = features.get("x_norm_patchtokens", None)
                     if tokens is not None:
+                        self.last_backend = "dinov2"
                         return self._project_dim(tokens[0].float())
                 if hasattr(self.model, "get_intermediate_layers"):
                     features = self.model.get_intermediate_layers(
@@ -64,13 +88,21 @@ class DINOv2GlobalDescriptorExtractor:
                         return_class_token=False,
                     )
                     if len(features) > 0:
+                        self.last_backend = "dinov2"
                         return self._project_dim(features[-1][0].float())
             except Exception:
                 self.model = None
 
+        self.last_backend = "fallback"
         pooled = F.adaptive_avg_pool2d(image, output_size=(8, 8))[0]
         tokens = pooled.flatten(1).T.contiguous()
         return self._project_dim(tokens)
+
+    def mean_pool_descriptor(self, tokens: torch.Tensor) -> torch.Tensor:
+        tokens = self.aggregator._normalize_tokens(tokens)
+        if tokens.shape[0] == 0:
+            return torch.zeros(self.descriptor_dim, device=self.device)
+        return F.normalize(tokens.mean(dim=0), dim=0)
 
     def _project_dim(self, tokens: torch.Tensor) -> torch.Tensor:
         if tokens.shape[-1] == self.descriptor_dim:
@@ -109,10 +141,32 @@ class DINOv2GlobalDescriptorExtractor:
 
 
 class VLADAggregator:
-    def __init__(self, num_clusters: int = 8, descriptor_dim: int = 64):
+    def __init__(self, num_clusters: int = 8, descriptor_dim: int = 64, warmup_keyframes: int = 8):
         self.num_clusters = int(num_clusters)
         self.descriptor_dim = int(descriptor_dim)
+        self.warmup_keyframes = int(warmup_keyframes)
         self.centroids: torch.Tensor | None = None
+        self.frozen = False
+        self._warmup_tokens: list[torch.Tensor] = []
+
+    @property
+    def is_ready(self) -> bool:
+        return self.centroids is not None and self.frozen
+
+    @torch.no_grad()
+    def observe(self, tokens: torch.Tensor) -> bool:
+        if self.frozen:
+            return False
+        tokens = self._normalize_tokens(tokens).detach().cpu()
+        if tokens.shape[0] == 0:
+            return False
+        self._warmup_tokens.append(tokens)
+        if len(self._warmup_tokens) >= max(self.warmup_keyframes, 1):
+            self.fit(torch.cat(self._warmup_tokens, dim=0))
+            self.frozen = self.centroids is not None
+            self._warmup_tokens.clear()
+            return self.frozen
+        return False
 
     @torch.no_grad()
     def fit(self, tokens: torch.Tensor) -> None:
@@ -129,8 +183,6 @@ class VLADAggregator:
     @torch.no_grad()
     def encode(self, tokens: torch.Tensor) -> torch.Tensor:
         tokens = self._normalize_tokens(tokens)
-        if self.centroids is None or self.centroids.device != tokens.device:
-            self.fit(tokens)
         if self.centroids is None:
             return torch.zeros(self.num_clusters * self.descriptor_dim, device=tokens.device)
         centroids = self.centroids.to(tokens.device, tokens.dtype)
@@ -193,15 +245,33 @@ class AnchorDescriptorIndex:
 
     @torch.no_grad()
     def add_keyframe(self, keyframe, anchor_id: int) -> None:
-        descriptor = self.extractor.extract(keyframe.frame.image).detach().cpu()
+        tokens = self.extractor.extract_tokens(keyframe.frame.image).detach().cpu()
+        became_ready = self.extractor.aggregator.observe(tokens)
+        descriptor = self.extractor.descriptor_from_tokens(tokens).detach().cpu()
+        desc = getattr(keyframe, "desc_kpts", None)
+        triangulated_points = 0
+        if desc is not None and getattr(desc, "has_pt3d", None) is not None:
+            triangulated_points = int(desc.has_pt3d.sum().detach().cpu().item())
+        centre = []
+        try:
+            centre = keyframe.get_centre(approx=True).detach().cpu().tolist()
+        except Exception:
+            pass
         self.records.append(
             {
                 "anchor_id": int(anchor_id),
                 "keyframe_index": int(keyframe.index),
                 "frame_id": int(keyframe.frame.frame_id),
+                "tokens": tokens,
                 "descriptor": descriptor,
+                "triangulated_points": int(triangulated_points),
+                "camera_centre": centre,
+                "descriptor_backend": self.extractor.last_backend,
+                "vlad_ready": bool(self.extractor.aggregator.is_ready),
             }
         )
+        if became_ready:
+            self._refresh_descriptors()
 
     def query_anchor(
         self,
@@ -264,3 +334,52 @@ class AnchorDescriptorIndex:
         ]
         candidates.sort(key=lambda item: item.score, reverse=True)
         return candidates[: (self.top_k if top_k is None else int(top_k))]
+
+    @torch.no_grad()
+    def query_frame_for_relocalization(
+        self,
+        frame,
+        top_k: int = 16,
+        exclude_self_frame_id: int | None = None,
+    ) -> list[RelocalizationCandidate]:
+        if len(self.records) == 0:
+            return []
+        tokens = self.extractor.extract_tokens(frame.image).detach().cpu()
+        query = self.extractor.descriptor_from_tokens(tokens).detach().cpu()
+        query = F.normalize(query, dim=0)
+        threshold = self.threshold.value()
+        candidates = []
+        raw_scores = []
+        for record in self.records:
+            if exclude_self_frame_id is not None and int(record["frame_id"]) == int(exclude_self_frame_id):
+                continue
+            descriptor = F.normalize(record["descriptor"], dim=0)
+            if descriptor.shape != query.shape:
+                continue
+            score = float(torch.dot(query, descriptor).item())
+            if str(record.get("descriptor_backend", "fallback")) == "fallback":
+                score *= 0.8
+            raw_scores.append(score)
+            candidates.append(
+                RelocalizationCandidate(
+                    anchor_id=int(record["anchor_id"]),
+                    keyframe_index=int(record["keyframe_index"]),
+                    frame_id=int(record["frame_id"]),
+                    score=score,
+                    threshold=threshold,
+                    triangulated_points=int(record.get("triangulated_points", 0)),
+                    camera_centre=list(record.get("camera_centre", [])),
+                    descriptor_backend=str(record.get("descriptor_backend", "fallback")),
+                    vlad_ready=bool(record.get("vlad_ready", False) and self.extractor.aggregator.is_ready),
+                )
+            )
+        self.threshold.observe(raw_scores)
+        candidates.sort(key=lambda item: item.score, reverse=True)
+        return candidates[: int(top_k)]
+
+    @torch.no_grad()
+    def _refresh_descriptors(self) -> None:
+        for record in self.records:
+            descriptor = self.extractor.descriptor_from_tokens(record["tokens"]).detach().cpu()
+            record["descriptor"] = descriptor
+            record["vlad_ready"] = bool(self.extractor.aggregator.is_ready)

@@ -10,7 +10,7 @@ import torch
 from pipeline.concurrency import ReadWriteLock
 from pipeline.frame_state import FrameState
 from scene.anchor_chunk_manager import AnchorChunkManager
-from scene.anchor_graph import AnchorGraph
+from scene.anchor_graph import AnchorGraph, sim3_scale_from_matrix
 from scene.anchor_local_map import AnchorLocalMap
 from scene.loop_verifier import LoopClosureVerifier, LoopVerificationResult
 from scene.scale_alignment import GridScaleAligner, ScaleAlignmentResult
@@ -75,18 +75,36 @@ class ReconstructionController:
             scale_alignment = self.align_inter_anchor_scale(reference_frame, new_frame)
             anchor.scale_alignment = scale_alignment
             if len(self.anchors) > 0:
-                anchor.s_anchor_to_world = (
-                    self.anchors[-1].s_anchor_to_world.to(self.device)
-                    * scale_alignment.global_scale.to(self.device).clamp_min(1e-8)
-                )
+                # Keep active training in the tracked pose scale until a verified
+                # Sim(3) correction is available. Raw monocular rollover ratios
+                # are retained for diagnostics but drift when multiplied anchor
+                # after anchor.
+                anchor.s_anchor_to_world = self.anchors[-1].s_anchor_to_world.to(self.device).clone()
         self.anchors.append(anchor)
         self.anchor_locks[anchor.anchor_id] = ReadWriteLock()
         self.graph.add_node(anchor.anchor_id, anchor.T_anchor_to_world)
         if len(self.anchors) > 1:
             prev_T = self.anchors[-2].T_anchor_to_world.to(self.device)
             T = torch.linalg.inv(prev_T) @ anchor.T_anchor_to_world
+            T = self._sequential_edge_measurement(T, scale_alignment)
             self.graph.add_sequential_edge(self.anchors[-2].anchor_id, anchor.anchor_id, T)
         return anchor
+
+    @staticmethod
+    def _sequential_edge_measurement(T_src_to_dst: torch.Tensor, scale_alignment: ScaleAlignmentResult | None) -> torch.Tensor:
+        if scale_alignment is None or int(scale_alignment.num_valid_cells) <= 0:
+            return T_src_to_dst
+        aligned_scale = torch.as_tensor(
+            scale_alignment.global_scale,
+            dtype=T_src_to_dst.dtype,
+            device=T_src_to_dst.device,
+        ).reshape(())
+        if not torch.isfinite(aligned_scale) or float(aligned_scale.item()) <= 0.0:
+            return T_src_to_dst
+        current_scale = sim3_scale_from_matrix(T_src_to_dst).to(dtype=T_src_to_dst.dtype, device=T_src_to_dst.device)
+        measured = T_src_to_dst.detach().clone()
+        measured[:3, :3] = measured[:3, :3] * (aligned_scale / current_scale.clamp_min(1e-8))
+        return measured
 
     def add_frame(self, frame: FrameState, anchor: AnchorLocalMap | None = None) -> None:
         self.frames.append(frame)

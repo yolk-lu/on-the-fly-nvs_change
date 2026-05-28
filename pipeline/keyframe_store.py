@@ -82,6 +82,14 @@ class TrackingKeyframe:
                 self.mask_pyr.append(F.avg_pool2d(self.mask_pyr[-1].float(), 2) > (1 - 1e-6))
 
     @property
+    def lastest_invdepth(self):
+        return self.latest_invdepth
+
+    @lastest_invdepth.setter
+    def lastest_invdepth(self, value) -> None:
+        self.latest_invdepth = value
+
+    @property
     def device(self) -> torch.device:
         return self.tW2C.device
 
@@ -145,6 +153,7 @@ class TrackingKeyframe:
         calibrated = (self.mono_idepth * scale_t + offset_t).clamp_min(1e-6).contiguous()
         self.mono_idepth = calibrated
         self.frame.mono_idepth = calibrated
+        self.frame.mono_depth_conf = self.mono_depth_conf
         self.depth_scale = torch.ones(1, device=self.device, dtype=calibrated.dtype)
         self.depth_offset = torch.zeros(1, device=self.device, dtype=calibrated.dtype)
         self.idepth_pyr = [calibrated[0]]
@@ -209,6 +218,10 @@ class TrackingKeyframe:
             info["name"] = self.info["name"]
         if "Rt" in self.info:
             info["gt_Rt"] = self.info["Rt"].detach().cpu().numpy().tolist()
+        if "pose_initialization" in self.info:
+            info["pose_initialization"] = dict(self.info["pose_initialization"])
+        if "mono_depth_alignment" in self.info:
+            info["mono_depth_alignment"] = dict(self.info["mono_depth_alignment"])
         return {"info": info, "Rt": self.get_Rt().detach().cpu().numpy().tolist(), "f": float(self.f.item())}
 
     def to_colmap(self, id: int) -> tuple[Camera, BaseImage]:
